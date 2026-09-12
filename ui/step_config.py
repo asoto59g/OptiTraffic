@@ -276,7 +276,8 @@ def step_config() -> None:
             ):
                 linked = st.session_state.selected_tls_id
                 edge_for_place = eid or ((st.session_state.selected_junction or {}).get("edges") or [""])[0]
-                tid = linked or (f"tls_j_{jid}" if jid else f"tls_{edge_for_place}")
+                # SUMO TLS id == junction id after --tls.set; avoid tls_j_* aliases
+                tid = linked or (str(jid) if jid else f"tls_{edge_for_place}")
                 edits.tls_placements = [
                     t
                     for t in edits.tls_placements
@@ -290,6 +291,9 @@ def step_config() -> None:
                         name=f"Cruce {jid}" if jid else ename,
                     )
                 )
+                # Drop legacy tls_j_* override keys for this junction
+                if jid:
+                    edits.tls_overrides.pop(f"tls_j_{jid}", None)
                 edits.tls_overrides[tid] = edits.tls_default
                 st.session_state.edits = edits
                 st.success("Semáforo confirmado en la intersección.")
@@ -397,7 +401,8 @@ def step_config() -> None:
     n_auto = sum(1 for s in edits.stops if (s.reason or "").startswith("default_"))
     st.caption(
         f"Altos: **{len(edits.stops)}** total · **{n_auto}** por regla default "
-        f"(calle N–S × avenida E–O). Avenidas quedan con vía libre en esos cruces."
+        f"(calle N–S × avenida E–O). En la simulación se aplican como `priority_stop` "
+        f"(avenidas con prioridad; calles con alto deben detenerse)."
     )
     if st.button("Reaplicar regla default (calles N-S con alto)"):
         tls_jids = {

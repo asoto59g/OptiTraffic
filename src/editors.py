@@ -265,6 +265,255 @@ def _phase_kind(state: str) -> str:
     return "red"
 
 
+def normalize_tls_id(tls_id: Optional[str], junction_id: Optional[str] = None) -> str:
+    """Map legacy tls_j_<junction> ids to the real SUMO TLS/junction id."""
+    tid = (tls_id or "").strip()
+    jid = (junction_id or "").strip()
+    if tid.startswith("tls_j_") and len(tid) > 6:
+        return tid[6:]
+    if tid.startswith("tls_") and jid:
+        return jid
+    if tid:
+        return tid
+    return jid
+
+
+def collect_tls_junction_ids(edits: NetworkEdits, osm_tls_ids: Optional[list[str]] = None) -> list[str]:
+    """Junction / TLS ids that must be traffic_light in the simulation net."""
+    ids: list[str] = []
+    for p in edits.tls_placements:
+        nid = normalize_tls_id(p.tls_id, p.junction_id)
+        if nid:
+            ids.append(nid)
+        elif p.junction_id:
+            ids.append(str(p.junction_id))
+    for tid in edits.tls_overrides.keys():
+        nid = normalize_tls_id(tid)
+        if nid:
+            ids.append(nid)
+    for tid in osm_tls_ids or []:
+        if tid:
+            ids.append(str(tid))
+    # Preserve order, unique
+    return list(dict.fromkeys(ids))
+
+
+def ensure_tls_junctions(
+    net_in: Path,
+    net_out: Path,
+    junction_ids: list[str],
+    netconvert_bin: Path,
+) -> Path:
+    """Force named junctions to be controlled by traffic lights via netconvert."""
+    import shutil
+
+    from .sumo_env import run_cmd
+
+    net_out.parent.mkdir(parents=True, exist_ok=True)
+    ids = [j for j in dict.fromkeys(junction_ids) if j]
+    if not ids:
+        if Path(net_in).resolve() != Path(net_out).resolve():
+            shutil.copy2(net_in, net_out)
+        return net_out
+
+    args = [
+        str(netconvert_bin),
+        "-s",
+        str(net_in),
+        "-o",
+        str(net_out),
+        "--tls.set",
+        ",".join(ids),
+        "--no-turnarounds.except-deadend",
+        "true",
+    ]
+    r = run_cmd(args, timeout=900)
+    if r.returncode != 0 or not net_out.is_file():
+        detail = (r.stderr or r.stdout or "")[:600]
+        raise RuntimeError(
+            f"netconvert --tls.set falló al crear semáforos en {ids[:12]}: {detail}"
+        )
+    return net_out
+
+
+def apply_stop_signs_to_net(
+    net_in: Path,
+    net_out: Path,
+    stops: list[StopSign],
+    *,
+    edges_gj: Optional[dict[str, Any]] = None,
+    netconvert_bin: Optional[Path] = None,
+    skip_junction_ids: Optional[set[str]] = None,
+) -> Path:
+    """
+    Encode real stop behaviour in the network:
+    - Junctions with altos (and without TLS) → type=priority_stop
+    - Stop edges get low priority; crossing avenidas get high priority
+    Then rebuild with netconvert so right-of-way is recalculated.
+    """
+    import shutil
+
+    if not stops:
+        if Path(net_in).resolve() != Path(net_out).resolve():
+            shutil.copy2(net_in, net_out)
+        return net_out
+
+    skip = {str(x) for x in (skip_junction_ids or set())}
+    role_by_edge: dict[str, str] = {}
+    if edges_gj:
+        for feat in edges_gj.get("features", []):
+            props = feat.get("properties") or {}
+            eid = props.get("id")
+            if eid is not None:
+                role_by_edge[str(eid)] = str(props.get("road_role") or "")
+
+    tree = ET.parse(net_in)
+    root = tree.getroot()
+
+    stop_edges = {str(s.edge_id) for s in stops if s.edge_id}
+    stop_jids: set[str] = set()
+    for s in stops:
+        if s.junction_id:
+            stop_jids.add(str(s.junction_id))
+        else:
+            # Infer junction = edge "to" node from net
+            for edge in root.findall("edge"):
+                if edge.get("id") == s.edge_id and not str(edge.get("id", "")).startswith(":"):
+                    to_n = edge.get("to")
+                    if to_n:
+                        stop_jids.add(str(to_n))
+
+    # Raise priority on avenidas that meet stop junctions; lower on stop approaches.
+    for edge in root.findall("edge"):
+        eid = edge.get("id") or ""
+        if eid.startswith(":"):
+            continue
+        to_n = edge.get("to") or ""
+        frm = edge.get("from") or ""
+        touches = to_n in stop_jids or frm in stop_jids
+        if not touches:
+            continue
+        role = role_by_edge.get(eid, "")
+        if eid in stop_edges:
+            edge.set("priority", "1")
+        elif role == "avenida":
+            edge.set("priority", "12")
+        elif role == "calle":
+            edge.set("priority", "2")
+        else:
+            # Unlabelled edge ending at stop junction: treat as minor if it is a stop edge only
+            try:
+                cur = int(float(edge.get("priority") or "1"))
+            except ValueError:
+                cur = 1
+            if eid in stop_edges:
+                edge.set("priority", "1")
+            elif cur < 9:
+                edge.set("priority", str(max(cur, 8)))
+
+    for junc in root.findall("junction"):
+        jid = junc.get("id") or ""
+        if jid not in stop_jids or jid in skip:
+            continue
+        jtype = (junc.get("type") or "").lower()
+        if jtype in ("traffic_light", "traffic_light_right_on_red", "traffic_light_unregulated"):
+            continue  # TLS wins over stop
+        junc.set("type", "priority_stop")
+
+    patched = net_out.with_suffix(".stops_patch.net.xml")
+    tree.write(patched, encoding="utf-8", xml_declaration=True)
+
+    if netconvert_bin is None:
+        shutil.move(str(patched), str(net_out))
+        return net_out
+
+    # Rebuild connections / right-of-way from patched priorities + junction types.
+    from .sumo_env import run_cmd
+
+    args = [
+        str(netconvert_bin),
+        "-s",
+        str(patched),
+        "-o",
+        str(net_out),
+        "--no-turnarounds.except-deadend",
+        "true",
+    ]
+    r = run_cmd(args, timeout=900)
+    try:
+        patched.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if r.returncode != 0 or not net_out.is_file():
+        detail = (r.stderr or r.stdout or "")[:600]
+        raise RuntimeError(f"netconvert al aplicar altos (priority_stop) falló: {detail}")
+    return net_out
+
+
+def prepare_sim_network(
+    net_in: Path,
+    net_out: Path,
+    edits: NetworkEdits,
+    *,
+    osm_tls_ids: Optional[list[str]] = None,
+    edges_gj: Optional[dict[str, Any]] = None,
+    netconvert_bin: Optional[Path] = None,
+) -> tuple[Path, list[str]]:
+    """
+    Build a simulation net where:
+    - confirmed / OSM junctions are real traffic lights
+    - configured altos are priority_stop with correct edge priorities
+    Returns (net_path, tls_ids_to_program).
+    """
+    import shutil
+    import tempfile
+
+    from .sumo_env import detect_sumo
+
+    sumo = detect_sumo()
+    nconv = netconvert_bin or sumo.netconvert_bin
+    if not nconv:
+        raise RuntimeError("netconvert no disponible para preparar semáforos/altos.")
+
+    net_out.parent.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="optitraffic_net_"))
+    try:
+        step1 = work / "tls.net.xml"
+        tls_jids = collect_tls_junction_ids(edits, osm_tls_ids)
+        ensure_tls_junctions(net_in, step1, tls_jids, nconv)
+
+        step2 = work / "stops.net.xml"
+        apply_stop_signs_to_net(
+            step1,
+            step2,
+            edits.stops,
+            edges_gj=edges_gj,
+            netconvert_bin=nconv,
+            skip_junction_ids=set(tls_jids),
+        )
+        shutil.copy2(step2, net_out)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    # Normalize override keys to real SUMO ids
+    remapped: dict[str, TlsTiming] = {}
+    for tid, timing in edits.tls_overrides.items():
+        remapped[normalize_tls_id(tid)] = timing
+    for p in edits.tls_placements:
+        nid = normalize_tls_id(p.tls_id, p.junction_id)
+        if nid and nid not in remapped:
+            remapped[nid] = edits.tls_default
+        if p.tls_id != nid and nid:
+            p.tls_id = nid
+    edits.tls_overrides = {k: v for k, v in remapped.items() if k}
+
+    programs = read_tls_programs_from_net(net_out)
+    tls_ids = list(dict.fromkeys([*tls_jids, *programs.keys(), *edits.tls_overrides.keys()]))
+    # Bake G/Y/R into the net's programID=0 (SUMO rejects a duplicate program 0 in additionals)
+    apply_tls_timings_to_net(net_out, edits, tls_ids)
+    return net_out, tls_ids
+
+
 def read_tls_programs_from_net(net_path: Path) -> dict[str, list[tuple[int, str]]]:
     """
     Return {tls_id: [(duration, state), ...]} from the first program of each TLS in the .net.xml.
@@ -295,6 +544,67 @@ def read_tls_programs_from_net(net_path: Path) -> dict[str, list[tuple[int, str]
     return out
 
 
+def _timing_for_tls(edits: NetworkEdits, tls_id: str) -> TlsTiming:
+    real = normalize_tls_id(tls_id) or tls_id
+    return (
+        edits.tls_overrides.get(real)
+        or edits.tls_overrides.get(tls_id)
+        or edits.tls_default
+    )
+
+
+def apply_tls_timings_to_net(
+    net_path: Path,
+    edits: NetworkEdits,
+    tls_ids: Optional[list[str]] = None,
+) -> int:
+    """
+    Rewrite phase durations on existing tlLogic programID=0 inside the .net.xml.
+    Keeps phase states (link count). Returns number of TLS programs updated.
+    """
+    if not net_path or not Path(net_path).is_file():
+        return 0
+
+    want: Optional[set[str]] = None
+    if tls_ids is not None:
+        want = {normalize_tls_id(t) or t for t in tls_ids if t}
+        want |= set(edits.tls_overrides.keys())
+
+    tree = ET.parse(net_path)
+    root = tree.getroot()
+    updated = 0
+    seen: set[str] = set()
+    for tl in root.findall("tlLogic"):
+        tid = tl.get("id") or ""
+        if not tid or tid in seen:
+            continue
+        pid = tl.get("programID") or "0"
+        if pid not in ("0", ""):
+            # Only patch the active/default program
+            continue
+        if want is not None and tid not in want and normalize_tls_id(tid) not in want:
+            continue
+        seen.add(tid)
+        timing = _timing_for_tls(edits, tid)
+        phases = list(tl.findall("phase"))
+        if not phases:
+            continue
+        for p in phases:
+            state = p.get("state") or ""
+            kind = _phase_kind(state)
+            if kind == "green":
+                p.set("duration", str(max(1, int(timing.green))))
+            elif kind == "yellow":
+                p.set("duration", str(max(1, int(timing.yellow))))
+            else:
+                p.set("duration", str(max(1, int(timing.red))))
+        updated += 1
+
+    if updated:
+        tree.write(net_path, encoding="utf-8", xml_declaration=True)
+    return updated
+
+
 def write_tls_add(
     out_path: Path,
     tls_ids: list[str],
@@ -302,40 +612,28 @@ def write_tls_add(
     net_path: Optional[Path] = None,
 ) -> Path:
     """
-    Write tlLogic additional file with user G/Y/R timings.
-    Keeps original phase *states* from the network (correct link count); only remaps durations.
-    TLS ids not present in the net are skipped (cannot invent a valid program without link count).
+    Document TLS timings. When net_path is set, timings are already baked into
+    sim.net.xml via apply_tls_timings_to_net — do NOT emit another programID=0
+    (SUMO errors: \"Another logic with id … and programID '0' exists\").
     """
-    programs = read_tls_programs_from_net(net_path) if net_path else {}
     root = ET.Element("additional")
-    written = 0
-    for tid in tls_ids:
-        phases = programs.get(tid)
-        if not phases:
-            continue
-        timing = edits.tls_overrides.get(tid, edits.tls_default)
-        tl = ET.SubElement(
-            root,
-            "tlLogic",
-            id=tid,
-            type="static",
-            programID="optitraffic",
-            offset="0",
+    if net_path and Path(net_path).is_file():
+        n = apply_tls_timings_to_net(Path(net_path), edits, tls_ids)
+        ids = ", ".join(sorted({normalize_tls_id(t) or t for t in tls_ids if t})[:30])
+        root.append(
+            ET.Comment(
+                f"TLS timings applied in net-file ({n} programs). "
+                f"Ids: {ids}. No duplicate tlLogic here (avoids programID clash)."
+            )
         )
-        for dur, state in phases:
-            kind = _phase_kind(state)
-            if kind == "green":
-                new_dur = max(1, int(timing.green))
-            elif kind == "yellow":
-                new_dur = max(1, int(timing.yellow))
-            else:
-                new_dur = max(1, int(timing.red))
-            ET.SubElement(tl, "phase", duration=str(new_dur), state=state)
-        written += 1
-
-    if written == 0:
-        # Empty additional would be useless; write a harmless comment-only file
-        root.append(ET.Comment("No TLS programs overridden (ids missing in net or empty list)"))
+    else:
+        # Offline / no net: cannot invent valid phase states — comment only
+        root.append(
+            ET.Comment(
+                "No net-file supplied; TLS timings must be applied via "
+                "prepare_sim_network / apply_tls_timings_to_net."
+            )
+        )
 
     _indent(root)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -374,20 +672,26 @@ def write_parking_add(out_path: Path, edits: NetworkEdits, edge_widths: Optional
 
 
 def write_stops_add(out_path: Path, edits: NetworkEdits) -> Path:
-    """Stop signs as stopping places near edge end (MVP approximation)."""
+    """
+    Document configured altos. Real stop behaviour is applied in the .net.xml
+    via prepare_sim_network / apply_stop_signs_to_net (priority_stop + priorities).
+    Do not emit fake lane <stop duration=…> landmarks — they do not enforce ROW.
+    """
     root = ET.Element("additional")
-    for i, s in enumerate(edits.stops):
-        ET.SubElement(
-            root,
-            "stop",
-            id=f"stop_{s.edge_id}_{i}",
-            lane=f"{s.edge_id}_0",
-            endPos="-5",
-            friendlyPos="true",
-            duration="3",
+    n = len(edits.stops)
+    ids = ", ".join(
+        f"{s.edge_id}" + (f"@{s.junction_id}" if s.junction_id else "")
+        for s in edits.stops[:40]
+    )
+    more = f" … (+{n - 40})" if n > 40 else ""
+    root.append(
+        ET.Comment(
+            f"Altos aplicados en la red (priority_stop): {n}. "
+            f"Edges: {ids}{more}"
+            if n
+            else "Sin altos configurados."
         )
-    # Also emit connection-style stop via <stop> on lane for parking-like halt —
-    # Real priority stops need netedit; we add a vType-friendly landmark file.
+    )
     _indent(root)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ET.ElementTree(root).write(out_path, encoding="utf-8", xml_declaration=True)
@@ -442,14 +746,32 @@ def write_all_additionals(
 ) -> list[Path]:
     scenario_dir.mkdir(parents=True, exist_ok=True)
     paths = []
-    # Include user-confirmed placements (prefer linked existing TLS id, else edge id)
+    # Include user-confirmed placements (real junction / TLS id, not tls_j_* aliases)
     placement_ids = []
     for p in edits.tls_placements:
-        tid = p.tls_id or f"tls_{p.edge_id}"
+        tid = normalize_tls_id(p.tls_id, p.junction_id) or (p.junction_id or "")
+        if not tid:
+            continue
+        if p.tls_id != tid:
+            p.tls_id = tid
         placement_ids.append(tid)
         if tid not in edits.tls_overrides:
             edits.tls_overrides[tid] = edits.tls_default
-    all_tls = list(dict.fromkeys([*tls_ids, *placement_ids, *edits.tls_overrides.keys()]))
+    # Remap legacy override keys
+    remapped: dict[str, TlsTiming] = {}
+    for tid, timing in edits.tls_overrides.items():
+        remapped[normalize_tls_id(tid) or tid] = timing
+    edits.tls_overrides = {k: v for k, v in remapped.items() if k}
+
+    all_tls = list(
+        dict.fromkeys(
+            [
+                *(normalize_tls_id(t) or t for t in tls_ids),
+                *placement_ids,
+                *edits.tls_overrides.keys(),
+            ]
+        )
+    )
     if all_tls:
         paths.append(
             write_tls_add(scenario_dir / "tls.add.xml", all_tls, edits, net_path=net_path)

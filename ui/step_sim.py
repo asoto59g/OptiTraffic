@@ -24,6 +24,7 @@ from src.flow_gates import (  # noqa: E402
     upsert_gate,
 )
 from src.editors import (  # noqa: E402
+    prepare_sim_network,
     write_all_additionals,
 )
 from src.network_build import (  # noqa: E402
@@ -507,14 +508,27 @@ def step_sim() -> None:
         status = st.empty()
         status.info("Preparando demanda…")
         try:
-            cap_network_speeds(Path(net), max_speed_ms=CITY_MAX_SPEED_MS)
+            # Bake confirmed TLS + altos into a sim net (priority_stop / --tls.set)
+            status.info("Preparando red (semáforos y altos)…")
+            osm_tls = [t["id"] for t in (st.session_state.tls_list or []) if t.get("id")]
+            sim_net = run_dir / "sim.net.xml"
+            with st.spinner("Aplicando semáforos y altos a la red…"):
+                sim_net, tls_ids = prepare_sim_network(
+                    Path(net),
+                    sim_net,
+                    st.session_state.edits,
+                    osm_tls_ids=osm_tls,
+                    edges_gj=edges_gj,
+                    netconvert_bin=sumo.netconvert_bin,
+                )
+            cap_network_speeds(sim_net, max_speed_ms=CITY_MAX_SPEED_MS)
             with st.spinner(
                 "Generando demanda OD (puertas)…"
                 if gates
                 else "Generando demanda calibrada…"
             ):
                 routes = generate_demand(
-                    Path(net),
+                    sim_net,
                     run_dir,
                     edge_ids if gates else seeds,
                     edge_levels=st.session_state.edge_levels,
@@ -526,15 +540,14 @@ def step_sim() -> None:
                     flow_gates=gates or None,
                 )
 
-            tls_ids = [t["id"] for t in (st.session_state.tls_list or [])]
             adds = write_all_additionals(
-                run_dir, st.session_state.edits, tls_ids, net_path=Path(net)
+                run_dir, st.session_state.edits, tls_ids, net_path=sim_net
             )
             add_files = [p for p in adds if p.suffix == ".xml" and "patch" not in p.name]
 
             cfg = write_sumocfg(
                 run_dir / "optitraffic.sumocfg",
-                Path(net),
+                sim_net,
                 routes,
                 additional_files=add_files or None,
                 begin=0,
