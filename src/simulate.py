@@ -325,16 +325,16 @@ def _find_sumo_gui_hwnd(pid: Optional[int] = None) -> Optional[int]:
 
 
 def _write_record_gui_settings(path: Path) -> Path:
-    """GUI settings so vehicles stay visible while recording (large glyphs)."""
+    """GUI settings for recording: near real-scale vehicles on the street grid."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         """<?xml version="1.0" encoding="UTF-8"?>
 <viewsettings>
     <scheme name="real world">
-        <vehicles vehicle_exaggeration="12" vehicle_minSize="60" vehicle_constantSize="1"
+        <vehicles vehicle_exaggeration="1.2" vehicle_minSize="1" vehicle_constantSize="0"
                   vehicle_quality="2" showBlinker="0"/>
-        <persons person_exaggeration="4" person_minSize="20" person_constantSize="1"/>
-        <edges edge_exaggeration="1.5"/>
+        <persons person_exaggeration="1" person_minSize="1" person_constantSize="0"/>
+        <edges edge_exaggeration="1.0"/>
     </scheme>
     <delay value="100"/>
 </viewsettings>
@@ -344,8 +344,8 @@ def _write_record_gui_settings(path: Path) -> Path:
     return path
 
 
-def _focus_gui_on_traffic(view_id: str = "View #0", *, pad_m: float = 120.0) -> bool:
-    """Point the camera at current vehicles so glyphs are on-screen and large enough."""
+def _focus_gui_on_traffic(view_id: str = "View #0", *, pad_m: float = 280.0) -> bool:
+    """Zoom to a street corridor around traffic (real scale, not vehicle close-up)."""
     try:
         import traci
     except Exception:
@@ -358,7 +358,7 @@ def _focus_gui_on_traffic(view_id: str = "View #0", *, pad_m: float = 120.0) -> 
         return False
     xs: list[float] = []
     ys: list[float] = []
-    for vid in vehs[:50]:
+    for vid in vehs[:80]:
         try:
             x, y = traci.vehicle.getPosition(vid)
             xs.append(float(x))
@@ -369,31 +369,30 @@ def _focus_gui_on_traffic(view_id: str = "View #0", *, pad_m: float = 120.0) -> 
         return False
     xmin, xmax = min(xs), max(xs)
     ymin, ymax = min(ys), max(ys)
-    if xmax - xmin < pad_m:
+    # Neighborhood-sized window so streets read clearly at real vehicle size.
+    min_span = max(pad_m, 220.0)
+    if xmax - xmin < min_span:
         cx = 0.5 * (xmin + xmax)
-        xmin, xmax = cx - pad_m * 0.5, cx + pad_m * 0.5
-    if ymax - ymin < pad_m:
+        xmin, xmax = cx - min_span * 0.5, cx + min_span * 0.5
+    if ymax - ymin < min_span:
         cy = 0.5 * (ymin + ymax)
-        ymin, ymax = cy - pad_m * 0.5, cy + pad_m * 0.5
+        ymin, ymax = cy - min_span * 0.5, cy + min_span * 0.5
+    margin = max(40.0, min_span * 0.08)
     try:
         traci.gui.setBoundary(
             view_id,
-            xmin - pad_m * 0.25,
-            ymin - pad_m * 0.25,
-            xmax + pad_m * 0.25,
-            ymax + pad_m * 0.25,
+            xmin - margin,
+            ymin - margin,
+            xmax + margin,
+            ymax + margin,
         )
-        try:
-            traci.gui.trackVehicle(view_id, vehs[0])
-        except Exception:
-            pass
         return True
     except Exception:
         return False
 
 
 def _zoom_gui_to_network(cfg_path: Path, view_id: str = "View #0") -> None:
-    """Zoom sumo-gui to the central part of the network (vehicles stay visible)."""
+    """Initial neighborhood zoom (~45% of network) until traffic appears."""
     try:
         import sumolib
         import traci
@@ -409,11 +408,10 @@ def _zoom_gui_to_network(cfg_path: Path, view_id: str = "View #0") -> None:
             return
         net = sumolib.net.readNet(str(net_path))
         xmin, ymin, xmax, ymax = net.getBoundary()
-        # Full-network fit makes cars look like dust; show ~35% around center.
         cx = 0.5 * (xmin + xmax)
         cy = 0.5 * (ymin + ymax)
-        half_w = max(80.0, (xmax - xmin) * 0.175)
-        half_h = max(80.0, (ymax - ymin) * 0.175)
+        half_w = max(150.0, (xmax - xmin) * 0.225)
+        half_h = max(150.0, (ymax - ymin) * 0.225)
         traci.gui.setBoundary(
             view_id,
             cx - half_w,
