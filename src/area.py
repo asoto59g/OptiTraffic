@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from geopy.geocoders import Nominatim
@@ -11,8 +15,15 @@ from shapely.geometry import Polygon, box, mapping, shape
 from shapely.ops import transform
 import pyproj
 
+from .logging_config import get_logger
+
+log = get_logger("area")
 
 MAX_AREA_KM2 = 25.0
+_USER_AGENT = "OptiTraffic/0.2 (local traffic simulator; respectful Nominatim use)"
+_MIN_INTERVAL_SEC = 1.1
+_CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "cache" / "nominatim"
+_RATE_FILE = _CACHE_DIR / "_last_request.json"
 
 
 @dataclass
@@ -22,6 +33,7 @@ class StudyArea:
     polygon: Polygon
     center: Tuple[float, float]  # lat, lon
     label: str
+    country_code: str = ""
 
     @property
     def bbox(self) -> Tuple[float, float, float, float]:
@@ -38,6 +50,7 @@ class StudyArea:
             "properties": {
                 "city": self.city,
                 "country": self.country,
+                "country_code": self.country_code,
                 "label": self.label,
                 "area_km2": round(self.area_km2, 3),
             },
@@ -60,14 +73,67 @@ def geodesic_area_km2(polygon: Polygon) -> float:
     return abs(projected.area) / 1_000_000.0
 
 
+def _cache_path(kind: str, key: str) -> Path:
+    digest = hashlib.sha256(f"{kind}:{key}".encode("utf-8")).hexdigest()[:40]
+    return _CACHE_DIR / f"{kind}_{digest}.json"
+
+
+def _read_cache(path: Path) -> Optional[dict[str, Any]]:
+    try:
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        log.warning("Nominatim cache read failed: %s", path, exc_info=True)
+    return None
+
+
+def _write_cache(path: Path, payload: dict[str, Any]) -> None:
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        log.warning("Nominatim cache write failed: %s", path, exc_info=True)
+
+
+def _respect_rate_limit() -> None:
+    """Enforce Nominatim usage policy (~1 req/s)."""
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        last = 0.0
+        if _RATE_FILE.is_file():
+            try:
+                last = float(json.loads(_RATE_FILE.read_text(encoding="utf-8")).get("ts") or 0)
+            except Exception:
+                last = 0.0
+        wait = _MIN_INTERVAL_SEC - (now - last)
+        if wait > 0:
+            time.sleep(wait)
+        _RATE_FILE.write_text(json.dumps({"ts": time.time()}), encoding="utf-8")
+    except Exception:
+        log.warning("Nominatim rate-limit bookkeeping failed", exc_info=True)
+        time.sleep(_MIN_INTERVAL_SEC)
+
+
+def _geolocator() -> Nominatim:
+    return Nominatim(user_agent=_USER_AGENT)
+
+
 def geocode_city(city: str, country: str) -> Tuple[float, float, str]:
-    """Return (lat, lon, display_name)."""
-    geolocator = Nominatim(user_agent="optitraffic-mvp/0.1")
+    """Return (lat, lon, display_name). Uses disk cache + rate limit."""
     query = f"{city}, {country}".strip(", ")
-    loc = geolocator.geocode(query, exactly_one=True, timeout=20)
+    cpath = _cache_path("fwd", query.lower())
+    cached = _read_cache(cpath)
+    if cached and "lat" in cached and "lon" in cached:
+        return float(cached["lat"]), float(cached["lon"]), str(cached.get("display") or query)
+
+    _respect_rate_limit()
+    loc = _geolocator().geocode(query, exactly_one=True, timeout=20)
     if loc is None:
         raise ValueError(f"No se encontró la ubicación: {query}")
-    return float(loc.latitude), float(loc.longitude), str(loc.address)
+    lat, lon, display = float(loc.latitude), float(loc.longitude), str(loc.address)
+    _write_cache(cpath, {"lat": lat, "lon": lon, "display": display, "query": query})
+    return lat, lon, display
 
 
 def reverse_geocode(lat: float, lon: float) -> Tuple[str, str, str]:
@@ -75,10 +141,27 @@ def reverse_geocode(lat: float, lon: float) -> Tuple[str, str, str]:
     Return (city, country, display_name) from coordinates.
     Falls back to empty city/country if Nominatim has no match.
     """
-    geolocator = Nominatim(user_agent="optitraffic-mvp/0.1")
-    loc = geolocator.reverse((lat, lon), exactly_one=True, timeout=20, language="es")
+    city, country, display, _code = reverse_geocode_full(lat, lon)
+    return city, country, display
+
+
+def reverse_geocode_full(lat: float, lon: float) -> Tuple[str, str, str, str]:
+    """Return (city, country, display_name, country_code ISO-3166-1 alpha-2)."""
+    key = f"{lat:.5f},{lon:.5f}"
+    cpath = _cache_path("rev", key)
+    cached = _read_cache(cpath)
+    if cached:
+        return (
+            str(cached.get("city") or ""),
+            str(cached.get("country") or ""),
+            str(cached.get("display") or key),
+            str(cached.get("country_code") or "").lower(),
+        )
+
+    _respect_rate_limit()
+    loc = _geolocator().reverse((lat, lon), exactly_one=True, timeout=20, language="es")
     if loc is None:
-        return "", "", f"{lat:.5f}, {lon:.5f}"
+        return "", "", f"{lat:.5f}, {lon:.5f}", ""
     raw = loc.raw.get("address") or {}
     city = (
         raw.get("city")
@@ -90,15 +173,25 @@ def reverse_geocode(lat: float, lon: float) -> Tuple[str, str, str]:
         or ""
     )
     country = raw.get("country") or ""
-    return str(city), str(country), str(loc.address)
+    code = str(raw.get("country_code") or "").lower()
+    display = str(loc.address)
+    _write_cache(
+        cpath,
+        {
+            "city": city,
+            "country": country,
+            "display": display,
+            "country_code": code,
+            "lat": lat,
+            "lon": lon,
+        },
+    )
+    return str(city), str(country), display, code
 
 
 def rectangle_around(lat: float, lon: float, half_km: float = 0.8) -> Polygon:
     """Axis-aligned rectangle roughly half_km from center."""
-    # ~111 km per degree latitude; longitude scaled by cos(lat)
     dlat = half_km / 111.0
-    import math
-
     dlon = half_km / (111.0 * max(0.2, math.cos(math.radians(lat))))
     return box(lon - dlon, lat - dlat, lon + dlon, lat + dlat)
 
@@ -138,12 +231,8 @@ def validate_area(polygon: Polygon, max_km2: float = MAX_AREA_KM2) -> Tuple[bool
     if km2 <= 0:
         return False, "El polígono tiene área cero."
     if km2 > max_km2:
-        return (
-            False,
-            f"Área {km2:.1f} km² supera el límite MVP de {max_km2} km². "
-            "Reduzca la zona de estudio.",
-        )
-    return True, f"Área OK: {km2:.2f} km²"
+        return False, f"Área {km2:.1f} km² supera el máximo de {max_km2:.0f} km²."
+    return True, f"{km2:.2f} km²"
 
 
 def build_study_area(
@@ -151,6 +240,7 @@ def build_study_area(
     country: str,
     polygon: Polygon,
     label: Optional[str] = None,
+    country_code: str = "",
 ) -> StudyArea:
     ok, msg = validate_area(polygon)
     if not ok:
@@ -163,4 +253,5 @@ def build_study_area(
         polygon=polygon,
         center=center,
         label=label or f"{city}, {country}",
+        country_code=(country_code or "").lower(),
     )

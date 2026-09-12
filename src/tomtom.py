@@ -23,7 +23,11 @@ USAGE_FILE = DATA_DIR / "cache" / "tomtom_usage.json"
 # Freemium guidance (vector flow tiles ~200k/month)
 MONTHLY_SOFT_LIMIT = 200_000
 CACHE_TTL_SEC = 90
+STALE_CACHE_MAX_SEC = 6 * 3600  # use stale tile if network fails (up to 6h)
 DEFAULT_ZOOM = 15
+CONNECT_TIMEOUT = 20
+READ_TIMEOUT = 60
+MAX_TILE_RETRIES = 3
 
 
 @dataclass
@@ -38,6 +42,50 @@ def load_api_key() -> Optional[str]:
     load_dotenv(_ENV_FILE, override=True)
     key = os.environ.get("TOMTOM_API_KEY", "").strip().strip('"').strip("'")
     return key or None
+
+
+def _redact(text: str, api_key: str = "") -> str:
+    out = str(text)
+    if api_key:
+        out = out.replace(api_key, "***")
+    out = out.replace("key=", "key=***")
+    return out
+
+
+def _http_session() -> requests.Session:
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "OptiTraffic/1.0 (TomTom flow client)",
+            "Accept": "*/*",
+        }
+    )
+    retry = Retry(
+        total=MAX_TILE_RETRIES,
+        connect=MAX_TILE_RETRIES,
+        read=MAX_TILE_RETRIES,
+        backoff_factor=1.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+_SESSION: Optional[requests.Session] = None
+
+
+def _session() -> requests.Session:
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = _http_session()
+    return _SESSION
 
 
 def _usage_load() -> dict[str, Any]:
@@ -107,21 +155,72 @@ def fetch_flow_tile(
 
     url = (
         f"https://api.tomtom.com/traffic/map/4/tile/flow/{traffic_type}/"
-        f"{zoom}/{x}/{y}.pbf?key={api_key}"
+        f"{zoom}/{x}/{y}.pbf"
     )
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    _usage_inc(1)
-    cache_path.write_bytes(r.content)
-    return r.content
+    try:
+        r = _session().get(
+            url,
+            params={"key": api_key},
+            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+        )
+        if r.status_code == 403:
+            raise RuntimeError(
+                "TomTom rechazó la clave (HTTP 403). Verifique TOMTOM_API_KEY y el plan Traffic."
+            )
+        if r.status_code == 429:
+            raise RuntimeError(
+                "TomTom rate-limit (HTTP 429). Espere un minuto o baje el zoom/tiles."
+            )
+        r.raise_for_status()
+        _usage_inc(1)
+        cache_path.write_bytes(r.content)
+        return r.content
+    except requests.RequestException as e:
+        # Network timeout / DNS: fall back to stale cache if reasonably fresh
+        if use_cache and cache_path.exists():
+            age = time.time() - cache_path.stat().st_mtime
+            if age < STALE_CACHE_MAX_SEC:
+                return cache_path.read_bytes()
+        raise RuntimeError(
+            _redact(
+                f"TomTom timeout/red en tile {zoom}/{x}/{y}: {e}. "
+                "Revise internet/VPN/firewall hacia api.tomtom.com.",
+                api_key,
+            )
+        ) from e
+
+
+def _is_empty_flow_tile(pbf_bytes: bytes) -> bool:
+    """TomTom returns a tiny PBF with layer 'empty' when there is no coverage."""
+    if not pbf_bytes or len(pbf_bytes) < 32:
+        # Typical empty tile is 11 bytes: layer name "empty"
+        if pbf_bytes and b"empty" in pbf_bytes:
+            return True
+        return len(pbf_bytes or b"") < 32
+    try:
+        import mapbox_vector_tile
+
+        tile = mapbox_vector_tile.decode(pbf_bytes)
+        if not tile:
+            return True
+        if set(tile.keys()) == {"empty"}:
+            return True
+        return sum(len(v.get("features") or []) for v in tile.values()) == 0
+    except Exception:
+        return False
 
 
 def decode_flow_tile(pbf_bytes: bytes) -> list[TrafficSegment]:
     import mapbox_vector_tile
 
+    if _is_empty_flow_tile(pbf_bytes):
+        return []
+
     tile = mapbox_vector_tile.decode(pbf_bytes)
     segments: list[TrafficSegment] = []
     for layer_name, layer in tile.items():
+        if layer_name == "empty":
+            continue
         for feat in layer.get("features", []):
             props = feat.get("properties") or {}
             level = props.get("traffic_level")
@@ -191,9 +290,20 @@ def fetch_traffic_for_bbox(
         tiles = tiles[:64]
 
     all_segs: list[TrafficSegment] = []
+    errors: list[str] = []
+    ok = 0
+    empty_tiles = 0
     for x, y in tiles:
-        raw = fetch_flow_tile(zoom, x, y, api_key)
-        segs = decode_flow_tile(raw)
+        try:
+            raw = fetch_flow_tile(zoom, x, y, api_key)
+            if _is_empty_flow_tile(raw):
+                empty_tiles += 1
+                continue
+            segs = decode_flow_tile(raw)
+        except Exception as e:
+            errors.append(_redact(str(e), api_key))
+            continue
+        ok += 1
         # Heuristic: if coords look like tile-local (0..4096), reproject
         fixed: list[TrafficSegment] = []
         for s in segs:
@@ -210,7 +320,81 @@ def fetch_traffic_for_bbox(
             else:
                 fixed.append(s)
         all_segs.extend(fixed)
+
+    stats = {
+        "tiles_ok": ok,
+        "tiles_empty": empty_tiles,
+        "tiles_total": len(tiles),
+        "segments": len(all_segs),
+        "errors": errors[:5],
+    }
+    fetch_traffic_for_bbox.last_stats = stats  # type: ignore[attr-defined]
+
+    if not all_segs:
+        if empty_tiles > 0 and empty_tiles >= max(1, len(tiles) - len(errors)):
+            raise RuntimeError(
+                "TomTom respondió OK pero sin datos de tráfico en esta zona "
+                f"({empty_tiles}/{len(tiles)} tiles vacíos). "
+                "La cobertura Vector Flow / Flow Segment de TomTom no incluye "
+                "Costa Rica (p. ej. Liberia/San José). En Europa/EE.UU. sí hay datos. "
+                "Use la calibración sintética de hora pico o continúe sin TomTom."
+            )
+        detail = errors[0] if errors else "sin segmentos decodificados"
+        raise RuntimeError(
+            "No se obtuvo tráfico TomTom "
+            f"(tiles con datos={ok}/{len(tiles)}, vacíos={empty_tiles}). Causa: {detail}"
+        )
     return all_segs
+
+
+def synthetic_peak_edge_levels(
+    edges_geojson: dict[str, Any],
+    *,
+    peak: bool = True,
+) -> dict[str, float]:
+    """
+    Fallback when TomTom has no coverage: relative speed 0..1 by road role/axis.
+
+    Peak hour: avenidas E–O a bit slower than calles; centro more congested.
+    """
+    levels: dict[str, float] = {}
+    for feat in edges_geojson.get("features", []):
+        props = feat.get("properties") or {}
+        eid = props.get("id")
+        if not eid:
+            continue
+        role = str(props.get("road_role") or "").lower()
+        name = str(props.get("name") or "").lower()
+        axis = str(props.get("axis") or "")
+        if not role:
+            if "avenida" in name or name.startswith("av"):
+                role = "avenida"
+            elif "calle" in name:
+                role = "calle"
+            elif axis == "EW":
+                role = "avenida"
+            elif axis == "NS":
+                role = "calle"
+            else:
+                role = "other"
+
+        if peak:
+            # Lower = more congested (relative speed)
+            if role == "avenida":
+                level = 0.45
+            elif role == "calle":
+                level = 0.65
+            else:
+                level = 0.75
+        else:
+            if role == "avenida":
+                level = 0.85
+            elif role == "calle":
+                level = 0.92
+            else:
+                level = 0.95
+        levels[str(eid)] = level
+    return levels
 
 
 def match_traffic_to_edges(
@@ -220,27 +404,54 @@ def match_traffic_to_edges(
 ) -> dict[str, float]:
     """
     Map edge_id -> traffic_level (0..1).
-    Uses nearest segment by midpoint distance.
+    Nearest TomTom segment to edge midpoint via STRtree (O(n log m)).
     """
     if not segments:
         return {}
 
+    from shapely.strtree import STRtree
+
+    geoms = [s.geometry for s in segments]
+    tree = STRtree(geoms)
+    # Shapely 2: query returns indices when return_distance not used with predicate
     result: dict[str, float] = {}
     for feat in edges_geojson.get("features", []):
-        eid = feat["properties"]["id"]
-        geom = shape(feat["geometry"])
+        props = feat.get("properties") or {}
+        eid = props.get("id")
+        if eid is None:
+            continue
+        try:
+            geom = shape(feat["geometry"])
+        except Exception:
+            continue
         if geom.is_empty:
             continue
         mid = geom.interpolate(0.5, normalized=True)
+        # Candidate neighbors in a small window around the midpoint
+        window = mid.buffer(max_dist_deg)
+        try:
+            idxs = tree.query(window)
+        except Exception:
+            idxs = []
         best = None
         best_d = 1e9
-        for seg in segments:
-            d = mid.distance(seg.geometry)
+        for i in idxs:
+            i = int(i)
+            if i < 0 or i >= len(segments):
+                continue
+            d = mid.distance(geoms[i])
             if d < best_d:
                 best_d = d
-                best = seg
+                best = segments[i]
+        if best is None:
+            # Fallback: nearest among all if query returned nothing (rare)
+            for seg in segments:
+                d = mid.distance(seg.geometry)
+                if d < best_d:
+                    best_d = d
+                    best = seg
         if best is not None and best_d <= max_dist_deg:
-            result[eid] = best.traffic_level
+            result[str(eid)] = best.traffic_level
     return result
 
 

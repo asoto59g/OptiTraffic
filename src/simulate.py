@@ -156,6 +156,7 @@ def run_simulation(
     step_length: float = 1.0,
     speed_cong_threshold: float = CONGESTION_SPEED_MS,
     edge_levels: Optional[dict[str, float]] = None,
+    warmup_s: float = 0.0,
 ) -> SimResult:
     sumo = sumo or detect_sumo()
     if not sumo.ok or not sumo.sumo_bin:
@@ -182,7 +183,7 @@ def run_simulation(
 
     try:
         traci.start(cmd, label=label)
-    except Exception as e1:
+    except Exception:
         _close_traci(label)
         time.sleep(0.5)
         try:
@@ -196,6 +197,7 @@ def run_simulation(
     traci.switch(label)
 
     # Peak-hour: reduce edge allowed speed from TomTom relative speed (level 1 = free).
+    # Note: TraCI has edge.setMaxSpeed but NOT edge.getMaxSpeed (use lane.getMaxSpeed).
     if edge_levels:
         for eid, level in edge_levels.items():
             try:
@@ -203,14 +205,18 @@ def run_simulation(
             except traci.TraCIException:
                 continue
     else:
-        # Still enforce municipal cap on all known edges
+        # Enforce municipal cap (net.xml should already be capped; set is idempotent).
         try:
             for eid in traci.edge.getIDList():
                 if eid.startswith(":"):
                     continue
                 try:
-                    cur = traci.edge.getMaxSpeed(eid)
-                    if cur > CITY_MAX_SPEED_MS:
+                    lane0 = f"{eid}_0"
+                    try:
+                        cur = traci.lane.getMaxSpeed(lane0)
+                    except traci.TraCIException:
+                        cur = CITY_MAX_SPEED_MS + 1.0
+                    if cur > CITY_MAX_SPEED_MS + 1e-6:
                         traci.edge.setMaxSpeed(eid, CITY_MAX_SPEED_MS)
                 except traci.TraCIException:
                     continue
@@ -222,6 +228,7 @@ def run_simulation(
     total_waiting = 0.0
     speed_samples = 0.0
     speed_sum = 0.0
+    warmup = max(0.0, float(warmup_s))
 
     try:
         end = float(traci.simulation.getEndTime())
@@ -229,6 +236,9 @@ def run_simulation(
         end = 1800.0
     if end <= 0 or end > 1e7:
         end = 1800.0
+    # Warmup cannot eat the whole run
+    if warmup >= end * 0.85:
+        warmup = max(0.0, end * 0.2)
 
     try:
         while True:
@@ -236,6 +246,10 @@ def run_simulation(
             t = float(traci.simulation.getTime())
             if t >= end:
                 break
+
+            # Let the network fill before KPIs (stabilization)
+            if t < warmup:
+                continue
 
             veh_ids = traci.vehicle.getIDList()
             vehicle_steps += len(veh_ids)
@@ -294,17 +308,27 @@ def run_simulation(
         edges[eid] = kpi
 
     corr = None
+    corr_detail = "sin_tomtom"
     if edge_levels:
         xs, ys = [], []
         for eid, level in edge_levels.items():
             if eid in edges:
                 xs.append(1.0 - float(level))
                 ys.append(max(0.0, 1.0 - edges[eid].mean_speed / CITY_MAX_SPEED_MS))
-        corr = _pearson(xs, ys)
+        if len(xs) < 3:
+            corr_detail = f"pocos_edges_comunes ({len(xs)}; se necesitan ≥3)"
+        else:
+            corr = _pearson(xs, ys)
+            if corr is None:
+                corr_detail = "sin_varianza (TomTom o simulación casi constantes)"
+            else:
+                corr_detail = f"ok n={len(xs)}"
+    else:
+        corr_detail = "sin_tomtom (paso 4 no calibró edges)"
 
     mean_speed = (speed_sum / speed_samples) if speed_samples else 0.0
     pct = (100.0 * congested / len(edges)) if edges else 0.0
-    return SimResult(
+    result = SimResult(
         duration_s=int(end),
         vehicle_steps=vehicle_steps,
         total_waiting=total_waiting,
@@ -313,6 +337,10 @@ def run_simulation(
         edges=edges,
         tomtom_correlation=corr,
     )
+    # Stash diagnostic for UI (not part of dataclass to keep exports stable)
+    result._corr_detail = corr_detail  # type: ignore[attr-defined]
+    result._warmup_s = warmup  # type: ignore[attr-defined]
+    return result
 
 
 def export_edge_csv(result: SimResult, path: Path) -> Path:

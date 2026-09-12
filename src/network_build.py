@@ -10,7 +10,10 @@ from typing import Any, Optional
 from shapely.geometry import LineString, mapping
 
 from .area import StudyArea
+from .logging_config import get_logger
 from .sumo_env import SumoEnv, detect_sumo, ensure_sumolib_on_path, run_cmd
+
+log = get_logger("network_build")
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 NETS_DIR = DATA_DIR / "nets"
@@ -221,6 +224,7 @@ def list_traffic_lights(net_path: Path, sumo: Optional[SumoEnv] = None) -> list[
             x, y = jn.getCoord()
             lon, lat = net.convertXY2LonLat(x, y)
         except Exception:
+            log.warning("TLS coord lookup failed for %s", tid, exc_info=True)
             # Try matching TLS id to a junction that controls traffic lights
             for jn in net.getNodes():
                 if jn.getType() == "traffic_light" and (jn.getID() == tid or tid.startswith(jn.getID())):

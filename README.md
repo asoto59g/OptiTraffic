@@ -38,9 +38,12 @@ cd OptiTraffic
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+pip install -r requirements-dev.txt
 copy .env.example .env
 # Edite .env: TOMTOM_API_KEY=... y SUMO_HOME=...
 ```
+
+Licencia del código: MIT (`LICENSE`). Datos OSM © colaboradores (ODbL); Geofabrik y TomTom según sus términos.
 
 ## Ejecutar
 
@@ -55,11 +58,11 @@ streamlit run app.py
 
 | Paso | Qué hace |
 |------|----------|
-| **1. Zona** | Ciudad/país, geocodificación, rectángulo, dibujo o GeoJSON (máx. ~25 km²). Detecta lugar por reverse geocode. |
-| **2. Red OSM→SUMO** | Overpass (rápido) o Geofabrik (extracto país) → recorte → `netconvert` → mapa de edges. |
-| **3. Configuración** | Clic en **cruces** (semáforos) o **calles** (alto/parqueo/carriles). Tiempos G/Y/R. **Guardar/cargar** config ligada al polígono. |
-| **4. TomTom** | Flow tiles → nivel relativo por edge (hora pico). |
-| **5. Simulación** | Demanda calibrada + TraCI → KPIs. Escenarios Bajo/Medio/Alto (veh/h). |
+| **1. Zona** | Ciudad + **país en lista** (Geofabrik), geocodificación, rectángulo/dibujo/GeoJSON (máx. ~25 km²). Preview del extracto. |
+| **2. Red OSM→SUMO** | Overpass (rápido) o Geofabrik (país, **tope 500 MB**) → recorte → `netconvert` → mapa de edges. |
+| **3. Configuración** | Clic en **cruces** (semáforos) o **calles** (alto/parqueo/carriles). Guardar/cargar config ligada al polígono. |
+| **4. TomTom** | Flow tiles o **calibración sintética** (CR sin cobertura TomTom Flow). |
+| **5. Simulación** | **Entradas/salidas** de flujo + warmup; demanda OD; duración larga; KPIs. |
 | **6. Resultados** | Mapa de congestión, CSV/GeoJSON, guardar escenario completo. |
 
 ---
@@ -93,8 +96,8 @@ En hora pico, TomTom **reduce la velocidad permitida del tramo** (no solo sube l
 
 - **Auto:** Overpass primero; si falla → Geofabrik + osmium.
 - **Solo Overpass:** ideal para polígonos pequeños.
-- **Solo Geofabrik:** extracto de país (p. ej. Costa Rica). El país del paso 1 debe estar mapeado (`Costa Rica`, `México`, etc.).
-- Rutas con acentos (OneDrive “Geomática”) se copian a `%LOCALAPPDATA%\OptiTraffic\` para herramientas nativas (netconvert, SUMO, osmium).
+- **Solo Geofabrik:** extracto de país. Tope por defecto **500 MB** (`OPTITRAFFIC_MAX_PBF_MB`). País del paso 1 vía lista + ISO/`index-v1.json` (fallback `COUNTRY_EXTRACTS`).
+- Rutas con acentos (OneDrive “Geomática”) se copian a `%LOCALAPPDATA%\OptiTraffic\` para herramientas nativas.
 
 ---
 
@@ -112,23 +115,36 @@ Al terminar la configuración (paso 3) o en resultados (paso 6):
 ## Estructura del proyecto
 
 ```
-app.py                 # Wizard Streamlit
+app.py                 # Orquestador Streamlit (sidebar + despacho)
+ui/                    # Pasos del wizard (zona, red, config, tomtom, sim, resultados)
 src/
-  area.py              # Zona, geocode, GeoJSON
-  osm_fetch.py         # Overpass / Geofabrik + clip
+  area.py              # Zona, Nominatim (caché + rate-limit), GeoJSON
+  osm_fetch.py         # Overpass / Geofabrik (+ tope PBF, index-v1)
   network_build.py     # netconvert, edges GeoJSON, tope 40 km/h
   editors.py           # TLS / parking / stops / lanes → XML SUMO
-  tomtom.py            # Flow tiles + match a edges
+  tomtom.py            # Flow tiles + STRtree match + sintético
+  flow_gates.py        # Entradas/salidas de demanda OD
   demand.py            # Demanda + escenarios de densidad
   traffic_params.py    # 40 km/h, 5 m, capacidad espacial
-  simulate.py          # TraCI, KPIs, cierre seguro de conexiones
-  viz.py               # Folium: red, cruces, sentidos, congestión
-  scenarios.py         # Guardar / cargar config ligada al polígono
-  sumo_env.py          # Detección SUMO_HOME
-data/                  # cache local (gitignored)
-scenarios/             # escenarios locales (gitignored)
-.env.example
+  simulate.py          # TraCI, KPIs, warmup
+  viz.py               # Folium
+  scenarios.py         # Guardar / cargar config
+  wizard_state.py      # Estado tipado del wizard
+  logging_config.py    # Logging central
+tests/                 # pytest (sin SUMO/TomTom por defecto)
+.github/workflows/ci.yml
+pyproject.toml
+LICENSE                # MIT
 requirements.txt
+requirements-dev.txt   # pytest, ruff
+```
+
+### Desarrollo / CI
+
+```powershell
+pip install -r requirements-dev.txt
+pytest -q -m "not integration"
+ruff check src ui tests app.py scripts
 ```
 
 ---
@@ -144,14 +160,11 @@ requirements.txt
 
 ## Changelog reciente (post-MVP inicial)
 
-- Pipeline OSM: Overpass + Geofabrik con validación de PBF (rechazo de HTML 200).
-- Rutas ASCII-safe en Windows (`%LOCALAPPDATA%\OptiTraffic`).
-- Config interactiva por clic en cruces/calles; zoom de configuración.
-- Guardar/cargar escenarios asociados al polígono.
-- Modelo 40 km/h, vehículo 5 m, topes Bajo/Medio/Alto + capacidad espacial.
-- TomTom reduce velocidad en presa; simulación TraCI más robusta.
-- Visualización de sentidos OSM (flechas / colores).
-- TLS additionals alineados al número de links del cruce.
+- Hardening: `ui/` modular, pytest + GitHub Actions, LICENSE MIT, logging.
+- Nominatim con caché/rate-limit; Geofabrik vía index + tope PBF 500 MB; país en selectbox.
+- Puertas entrada/salida + simulación larga con warmup; TomTom sintético si no hay cobertura (CR).
+- `match_traffic_to_edges` con STRtree; pipeline OSM ASCII-safe en Windows.
+- Modelo 40 km/h, topes Bajo/Medio/Alto, escenarios ligados al polígono.
 
 ---
 

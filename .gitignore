@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 .streamlit/secrets.toml
 data/osm/
 data/nets/
@@ -17,5 +18,8 @@ scenarios/*/
 *.sumocfg
 *.rou.xml
 *.trips.xml
+*.egg-info/
+app.py.bak
+app.py.badenc
 .DS_Store
 Thumbs.db

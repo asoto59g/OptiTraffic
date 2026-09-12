@@ -448,3 +448,41 @@ def map_key(*parts: Any) -> str:
         for p in parts
         if p is not None
     )
+
+
+def add_flow_gate_markers(
+    m: folium.Map,
+    gates: Sequence[Any],
+    selected_edge_id: Optional[str] = None,
+) -> folium.Map:
+    """Markers for entry (green) / exit (orange); selected gate highlighted yellow."""
+    for g in gates:
+        kind = getattr(g, "kind", None) or (g.get("kind") if isinstance(g, dict) else None)
+        eid = getattr(g, "edge_id", None) or (g.get("edge_id") if isinstance(g, dict) else None)
+        lat = getattr(g, "lat", None) if not isinstance(g, dict) else g.get("lat")
+        lon = getattr(g, "lon", None) if not isinstance(g, dict) else g.get("lon")
+        vph = getattr(g, "vehs_per_hour", None) if not isinstance(g, dict) else g.get("vehs_per_hour")
+        name = getattr(g, "name", None) if not isinstance(g, dict) else g.get("name")
+        sentido = getattr(g, "sentido", None) if not isinstance(g, dict) else g.get("sentido")
+        if lat is None or lon is None or eid is None:
+            continue
+        is_entry = str(kind) == "entry"
+        color = "#1e8449" if is_entry else "#d35400"
+        label = "ENTRADA" if is_entry else "SALIDA"
+        sel = str(eid) == str(selected_edge_id)
+        if sel:
+            color = "#f1c40f"  # yellow when selected from list/map
+        sentido_txt = f" · {sentido}" if sentido else ""
+        folium.CircleMarker(
+            location=[float(lat), float(lon)],
+            radius=12 if sel else 7,
+            color="#7d6608" if sel else ("#1e8449" if is_entry else "#d35400"),
+            weight=4 if sel else 2,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.95,
+            tooltip=(
+                f"{label}{sentido_txt} · {int(float(vph or 0))} veh/h · {name or eid}"
+            ),
+        ).add_to(m)
+    return m

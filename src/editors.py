@@ -35,6 +35,7 @@ class ParkingConfig:
 class StopSign:
     edge_id: str
     junction_id: Optional[str] = None
+    reason: str = ""  # e.g. "default_ns_calle_x_avenida"
 
 
 @dataclass
@@ -45,6 +46,159 @@ class TlsPlacement:
     tls_id: Optional[str] = None  # existing SUMO TLS if known
     junction_id: Optional[str] = None
     name: str = ""
+
+
+def _normalize_road_name(name: str) -> str:
+    return (name or "").strip().lower()
+
+
+def classify_road_role(name: str, bearing_deg: Optional[float] = None) -> str:
+    """
+    Return 'avenida' | 'calle' | 'other'.
+
+    Costa Rica convention (Liberia / San José centro):
+    - Avenidas ≈ east–west
+    - Calles ≈ north–south
+    Name wins when present; otherwise use bearing (0°=N, 90°=E).
+    """
+    n = _normalize_road_name(name)
+    if n:
+        if n.startswith("avenida") or n.startswith("av.") or n.startswith("av "):
+            return "avenida"
+        if "avenida" in n:
+            return "avenida"
+        if n.startswith("calle") or "calle" in n:
+            return "calle"
+    if bearing_deg is None:
+        return "other"
+    # Fold to [0, 180): 45–135 → E–W (avenida), else N–S (calle)
+    b = abs(float(bearing_deg)) % 180.0
+    if 45.0 <= b <= 135.0:
+        return "avenida"
+    return "calle"
+
+
+def edge_bearing_deg(coords: list) -> Optional[float]:
+    """Bearing from first to last coordinate (lon, lat), degrees clockwise from north."""
+    import math
+
+    if not coords or len(coords) < 2:
+        return None
+    lon0, lat0 = float(coords[0][0]), float(coords[0][1])
+    lon1, lat1 = float(coords[-1][0]), float(coords[-1][1])
+    return math.degrees(math.atan2(lon1 - lon0, lat1 - lat0)) % 360.0
+
+
+def annotate_road_roles(edges_geojson: dict[str, Any]) -> dict[str, Any]:
+    """Add properties: bearing, road_role (avenida/calle/other), axis (EW/NS)."""
+    for feat in edges_geojson.get("features", []):
+        props = feat.setdefault("properties", {})
+        coords = (feat.get("geometry") or {}).get("coordinates") or []
+        bearing = edge_bearing_deg(coords)
+        role = classify_road_role(str(props.get("name") or ""), bearing)
+        props["bearing"] = None if bearing is None else round(float(bearing), 1)
+        props["road_role"] = role
+        if bearing is None:
+            props["axis"] = ""
+        else:
+            b = abs(float(bearing)) % 180.0
+            props["axis"] = "EW" if 45.0 <= b <= 135.0 else "NS"
+    return edges_geojson
+
+
+def default_stops_ns_at_avenues(
+    edges_geojson: dict[str, Any],
+    junctions: list[dict[str, Any]],
+    *,
+    min_degree: int = 3,
+    skip_junction_ids: Optional[set[str]] = None,
+) -> list[StopSign]:
+    """
+    Default Costa Rica centro rule:
+    - Avenidas (E–O) have free passage at the intersection.
+    - Calles (N–S) get a stop (alto) where they meet an avenida.
+
+    Places StopSign on N–S / calle edges that arrive at (to=) a junction that also
+    has at least one E–W / avenida edge. Skips TLS junctions if provided.
+    """
+    skip = skip_junction_ids or set()
+    annotate_road_roles(edges_geojson)
+
+    by_id: dict[str, dict[str, Any]] = {}
+    for feat in edges_geojson.get("features", []):
+        props = feat.get("properties") or {}
+        eid = props.get("id")
+        if eid:
+            by_id[str(eid)] = props
+
+    stops: list[StopSign] = []
+    seen: set[tuple[str, str]] = set()
+
+    for j in junctions:
+        jid = str(j.get("id") or "")
+        if not jid or jid in skip:
+            continue
+        if int(j.get("degree") or 0) < min_degree:
+            continue
+        edge_ids = [str(e) for e in (j.get("edges") or []) if e]
+        roles = []
+        for eid in edge_ids:
+            props = by_id.get(eid) or {}
+            role = props.get("road_role") or "other"
+            axis = props.get("axis") or ""
+            # Treat EW other as avenida-like, NS other as calle-like when name missing
+            if role == "other":
+                if axis == "EW":
+                    role = "avenida"
+                elif axis == "NS":
+                    role = "calle"
+            roles.append((eid, role, props))
+
+        has_avenida = any(r == "avenida" for _, r, _ in roles)
+        if not has_avenida:
+            continue
+
+        for eid, role, props in roles:
+            if role != "calle":
+                continue
+            # Only approaches that end at this junction (incoming)
+            if str(props.get("to") or "") != jid:
+                continue
+            key = (eid, jid)
+            if key in seen:
+                continue
+            seen.add(key)
+            stops.append(
+                StopSign(
+                    edge_id=eid,
+                    junction_id=jid,
+                    reason="default_calle_NS_x_avenida_EW",
+                )
+            )
+    return stops
+
+
+def merge_default_stops(edits: NetworkEdits, suggested: list[StopSign], replace_defaults: bool = True) -> int:
+    """
+    Merge suggested stops into edits.
+    If replace_defaults, drop previous auto defaults (reason startswith default_) then add.
+    Returns number of stops added.
+    """
+    if replace_defaults:
+        edits.stops = [s for s in edits.stops if not (s.reason or "").startswith("default_")]
+    existing = {(s.edge_id, s.junction_id) for s in edits.stops}
+    added = 0
+    for s in suggested:
+        key = (s.edge_id, s.junction_id)
+        if key in existing:
+            continue
+        # Also skip if same edge already has any stop
+        if any(x.edge_id == s.edge_id for x in edits.stops):
+            continue
+        edits.stops.append(s)
+        existing.add(key)
+        added += 1
+    return added
 
 
 @dataclass
@@ -77,7 +231,12 @@ class NetworkEdits:
             edits.tls_overrides[tid] = TlsTiming(**timing)
         edits.lane_overrides = [LaneOverride(**x) for x in d.get("lane_overrides") or []]
         edits.parking = [ParkingConfig(**x) for x in d.get("parking") or []]
-        edits.stops = [StopSign(**x) for x in d.get("stops") or []]
+        edits.stops = [StopSign(**{k: x[k] for k in ("edge_id", "junction_id", "reason") if k in x}) for x in d.get("stops") or []]
+        # Ensure reason default for legacy saves
+        for s in edits.stops:
+            if not hasattr(s, "reason"):
+                s.reason = ""
+
         edits.tls_placements = [TlsPlacement(**x) for x in d.get("tls_placements") or []]
         edits.min_width_both_sides_m = float(d.get("min_width_both_sides_m", 9.0))
         return edits

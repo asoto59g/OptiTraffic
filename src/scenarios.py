@@ -13,6 +13,9 @@ from shapely.geometry import shape
 
 from .area import StudyArea, build_study_area, load_geojson_polygon
 from .editors import NetworkEdits
+from .logging_config import get_logger
+
+log = get_logger("scenarios")
 
 ROOT = Path(__file__).resolve().parents[1]
 SCENARIOS_DIR = ROOT / "scenarios"
@@ -40,6 +43,7 @@ def polygon_iou(a, b) -> float:
             return 0.0
         return float(inter / union)
     except Exception:
+        log.warning("polygon_iou failed", exc_info=True)
         return 0.0
 
 
@@ -61,6 +65,7 @@ def scenarios_matching_area(
             if iou >= min_iou:
                 out.append((folder, meta, iou))
         except Exception:
+            log.warning("Skipping scenario folder %s", folder, exc_info=True)
             continue
     out.sort(key=lambda x: x[2], reverse=True)
     return out
@@ -89,12 +94,13 @@ def save_scenario(
     result_summary: Optional[dict[str, Any]] = None,
     extra_files: Optional[list[Path]] = None,
     overwrite: bool = False,
+    flow_gates: Optional[list[dict[str, Any]]] = None,
 ) -> Path:
     """
     Persist zone configuration tied to the study polygon.
 
     Stores: polygon, edits (TLS/parking/stops/lanes), optional net, edges GeoJSON,
-    TLS list, TomTom levels, result summary.
+    TLS list, TomTom levels, flow gates, result summary.
     """
     SCENARIOS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -133,6 +139,7 @@ def save_scenario(
         "net_file": net_local,
         "net_path": str(folder / net_local) if net_local else (str(net_path) if net_path else None),
         "edge_levels": edge_levels or {},
+        "flow_gates": flow_gates or [],
         "has_edges_geojson": bool(edges_gj) or (folder / "edges.geojson").exists(),
         "has_tls_list": tls_list is not None or (folder / "tls_list.json").exists(),
         "counts": {
@@ -141,6 +148,7 @@ def save_scenario(
             "stops": len(edits.stops),
             "lane_overrides": len(edits.lane_overrides),
             "tls_overrides": len(edits.tls_overrides),
+            "flow_gates": len(flow_gates or []),
         },
         "result_summary": result_summary,
     }
@@ -168,6 +176,7 @@ def load_scenario(folder: Path) -> dict[str, Any]:
         props.get("country", ""),
         poly,
         label=props.get("label"),
+        country_code=str(props.get("country_code") or ""),
     )
     edits = NetworkEdits.from_dict(meta.get("edits") or {})
 
@@ -194,6 +203,7 @@ def load_scenario(folder: Path) -> dict[str, Any]:
         "edits": edits,
         "folder": folder,
         "edge_levels": meta.get("edge_levels") or {},
+        "flow_gates": meta.get("flow_gates") or [],
         "net_path": net_path,
         "edges_gj": edges_gj,
         "tls_list": tls_list,
@@ -209,6 +219,7 @@ def apply_scenario_to_session(data: dict[str, Any], session: Any) -> str:
     session.area = area
     session.edits = data["edits"]
     session.edge_levels = data.get("edge_levels") or {}
+    session.flow_gates = data.get("flow_gates") or []
     session.city = area.city
     session.country = area.country
     session.center = area.center

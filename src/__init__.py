@@ -1,3 +1,2 @@
-"""OptiTraffic: urban traffic simulation with Streamlit + SUMO + TomTom."""
-
-__version__ = "0.1.0"
+# OptiTraffic package marker (modules live under src/).
+__version__ = "0.2.0"
