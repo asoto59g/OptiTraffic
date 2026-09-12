@@ -441,12 +441,18 @@ def step_sim() -> None:
         disabled=not gui_ok,
         help=(
             "Abre sumo-gui, captura pantallas cada N segundos de simulación y "
-            "arma un MP4 con ffmpeg. Más lento que sumo headless."
+            "arma un MP4 con ffmpeg. Más lento que sumo headless. "
+            "No minimice la ventana de SUMO mientras graba."
         ),
     )
     record_every = 10.0
     video_fps = 5.0
     if record_video and gui_ok:
+        st.warning(
+            "La grabación espera a que haya **vehículos**, enfoca la cámara en el tráfico "
+            "y recién entonces captura. Deje sumo-gui visible; el MP4 se arma al final. "
+            "Con grabación la simulación es más lenta (~100 ms/paso)."
+        )
         rc1, rc2 = st.columns(2)
         with rc1:
             record_every = float(
@@ -539,8 +545,16 @@ def step_sim() -> None:
                 + (" · grabando video" if record_video else "")
                 + ")… puede tardar varios minutos."
             )
+
+            def _on_progress(t: float, end_t: float, frames: int) -> None:
+                status.info(
+                    f"SUMO {t:.0f}/{end_t:.0f}s"
+                    + (f" · frames={frames}" if record_video else "")
+                    + "…"
+                )
+
             with st.spinner(
-                "Ejecutando SUMO-GUI + capturas…"
+                "Ejecutando SUMO-GUI + capturas… (mire el reloj en sumo-gui)"
                 if record_video
                 else "Ejecutando SUMO (TraCI)…"
             ):
@@ -554,6 +568,7 @@ def step_sim() -> None:
                     frames_dir=run_dir / "frames",
                     video_path=run_dir / "simulation.mp4",
                     video_fps=float(video_fps),
+                    progress_cb=_on_progress,
                 )
             st.session_state.sim_result = result
             export_edge_csv(result, run_dir / "edges.csv")

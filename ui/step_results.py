@@ -87,21 +87,55 @@ def step_results() -> None:
         )
 
     video_path = getattr(result, "video_path", None)
-    frames_dir = getattr(result, "frames_dir", None)
+    frames_dir = getattr(result, "frames_dir", None) or str(Path(run_dir) / "frames")
     frames_count = int(getattr(result, "frames_count", 0) or 0)
-    if video_path and Path(video_path).exists():
+    disk_mp4 = Path(run_dir) / "simulation.mp4"
+    if (not video_path or not Path(str(video_path)).exists() or Path(str(video_path)).stat().st_size < 1000) and disk_mp4.exists() and disk_mp4.stat().st_size > 1000:
+        video_path = str(disk_mp4)
+    if frames_count <= 0:
+        frames_count = len(list(Path(frames_dir).glob("frame_*.png"))) if Path(frames_dir).exists() else 0
+
+    st.markdown("**Video / capturas**")
+    mp4_ok = bool(video_path and Path(video_path).exists() and Path(video_path).stat().st_size > 1000)
+    frames_path_obj = Path(frames_dir) if frames_dir else Path(run_dir) / "frames"
+
+    if not mp4_ok and frames_count > 0 and frames_path_obj.is_dir():
+        if st.button("Generar MP4 desde frames (ffmpeg)", key="reencode_mp4"):
+            try:
+                from src.simulate import encode_frames_to_mp4
+
+                out = encode_frames_to_mp4(frames_path_obj, Path(run_dir) / "simulation.mp4", fps=5.0)
+                st.session_state.sim_result.video_path = str(out)  # type: ignore[union-attr]
+                st.success(f"MP4 listo ({out.stat().st_size // 1024} KB)")
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo ensamblar el MP4: {e}")
+
+    if mp4_ok:
         st.download_button(
             "Descargar video (MP4)",
             Path(video_path).read_bytes(),
             file_name="simulation.mp4",
             mime="video/mp4",
+            key="dl_sim_mp4",
         )
-        st.caption(f"Video: `{video_path}` · {frames_count} frames")
-    elif frames_count and frames_dir:
+        st.caption(f"`{video_path}` · {frames_count} frames · {Path(video_path).stat().st_size // 1024} KB")
+    elif frames_count > 0:
         st.info(
-            f"Hay **{frames_count}** capturas PNG en `{frames_dir}` "
-            "(ffmpeg no generó MP4 o no está instalado)."
+            f"Hay **{frames_count}** PNG en `{frames_dir}` "
+            "(el MP4 falló antes: suele ser resolución impar; use el botón de arriba)."
         )
+        st.caption(f"Carpeta: `{frames_dir}`")
+    else:
+        st.warning(
+            "No se generó video ni frames. La carpeta esperada es "
+            f"`{Path(run_dir) / 'frames'}` (suele estar en "
+            "`%LOCALAPPDATA%\\OptiTraffic\\runs\\current\\`). "
+            "Vuelva a simular con **Grabar video** y deje sumo-gui visible."
+        )
+        detail = getattr(result, "_corr_detail", None)
+        if detail and "video:" in str(detail):
+            st.caption(str(detail))
 
     name = st.text_input("Nombre del escenario", value=f"{st.session_state.city}_mvp")
     overwrite = st.checkbox("Sobrescribir si existe el mismo nombre", value=False, key="res_overwrite")

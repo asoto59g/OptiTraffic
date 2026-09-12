@@ -6,6 +6,7 @@ import csv
 import json
 import shutil
 import subprocess
+import sys
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
@@ -172,8 +173,17 @@ def encode_frames_to_mp4(
         raise FileNotFoundError(
             "ffmpeg no está en PATH. Instálelo o use solo los PNG en la carpeta de frames."
         )
+    frames = sorted(frames_dir.glob("frame_*.png"))
+    if not frames:
+        raise FileNotFoundError(f"No hay frames PNG en {frames_dir}")
     pattern = str(frames_dir / "frame_%06d.png")
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists():
+        try:
+            out_path.unlink()
+        except OSError:
+            pass
+    # libx264 + yuv420p requires even width/height (window grabs are often odd).
     cmd = [
         str(ffmpeg),
         "-y",
@@ -181,6 +191,8 @@ def encode_frames_to_mp4(
         str(fps),
         "-i",
         pattern,
+        "-vf",
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2",
         "-c:v",
         "libx264",
         "-pix_fmt",
@@ -190,11 +202,322 @@ def encode_frames_to_mp4(
         str(out_path),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    if r.returncode != 0 or not out_path.exists():
+    if r.returncode != 0 or not out_path.exists() or out_path.stat().st_size < 1000:
+        if out_path.exists() and out_path.stat().st_size < 1000:
+            try:
+                out_path.unlink()
+            except OSError:
+                pass
         raise RuntimeError(
             "ffmpeg falló al crear el video:\n" + (r.stderr or r.stdout or "sin detalle")[:800]
         )
     return out_path
+
+
+def _traci_sumo_pid(label: str) -> Optional[int]:
+    """PID of the sumo/sumo-gui process started by TraCI (if available)."""
+    try:
+        import traci
+
+        conn = traci.getConnection(label)
+    except Exception:
+        return None
+    # TraCI Connection stores Popen as `_process` (not `_sumoProcess`).
+    for attr in ("_process", "process", "_sumoProcess", "sumoProcess"):
+        proc = getattr(conn, attr, None)
+        if proc is not None and getattr(proc, "pid", None):
+            try:
+                return int(proc.pid)
+            except (TypeError, ValueError):
+                return None
+    try:
+        from traci import connection as traci_connection
+
+        for _lab, c in getattr(traci_connection, "_connections", {}).items():
+            proc = getattr(c, "_process", None)
+            if proc is not None and getattr(proc, "pid", None):
+                return int(proc.pid)
+    except Exception:
+        pass
+    return None
+
+
+def _is_sumo_gui_window_title(title: str) -> bool:
+    """True only for real sumo-gui windows — never Streamlit/browser/IDE."""
+    low = (title or "").lower()
+    if not low:
+        return False
+    deny = (
+        "chrome",
+        "msedge",
+        "firefox",
+        "streamlit",
+        "localhost",
+        "cursor",
+        "visual studio",
+        "code -",
+        "powershell",
+        "cmd.exe",
+        "explorer",
+    )
+    if any(d in low for d in deny):
+        return False
+    if ".sumocfg" in low:
+        return True
+    # Typical title: "… - SUMO 1.27.1"
+    if "sumo" in low and any(ch.isdigit() for ch in low):
+        return True
+    return False
+
+
+def _hwnd_title(hwnd: int) -> str:
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    length = int(user32.GetWindowTextLengthW(hwnd))
+    if length <= 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buf, length + 1)
+    return (buf.value or "").strip()
+
+
+def _find_sumo_gui_hwnd(pid: Optional[int] = None) -> Optional[int]:
+    """Find sumo-gui window by TraCI PID first, then strict title (Windows)."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    by_pid: list[tuple[int, int]] = []
+    by_title: list[tuple[int, int]] = []
+
+    def _cb(hwnd: int, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        title = _hwnd_title(hwnd)
+        if not title:
+            return True
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return True
+        w = int(rect.right) - int(rect.left)
+        h = int(rect.bottom) - int(rect.top)
+        if w < 200 or h < 150:
+            return True
+        area = w * h
+        proc_id = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
+        if pid and int(proc_id.value) == int(pid):
+            by_pid.append((area, int(hwnd)))
+        elif _is_sumo_gui_window_title(title):
+            by_title.append((area, int(hwnd)))
+        return True
+
+    user32.EnumWindows(EnumWindowsProc(_cb), 0)
+    pool = by_pid or by_title
+    if not pool:
+        return None
+    pool.sort(reverse=True)
+    return pool[0][1]
+
+
+def _write_record_gui_settings(path: Path) -> Path:
+    """GUI settings so vehicles stay visible while recording (large glyphs)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<viewsettings>
+    <scheme name="real world">
+        <vehicles vehicle_exaggeration="12" vehicle_minSize="60" vehicle_constantSize="1"
+                  vehicle_quality="2" showBlinker="0"/>
+        <persons person_exaggeration="4" person_minSize="20" person_constantSize="1"/>
+        <edges edge_exaggeration="1.5"/>
+    </scheme>
+    <delay value="100"/>
+</viewsettings>
+""",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _focus_gui_on_traffic(view_id: str = "View #0", *, pad_m: float = 120.0) -> bool:
+    """Point the camera at current vehicles so glyphs are on-screen and large enough."""
+    try:
+        import traci
+    except Exception:
+        return False
+    try:
+        vehs = list(traci.vehicle.getIDList())
+    except Exception:
+        return False
+    if not vehs:
+        return False
+    xs: list[float] = []
+    ys: list[float] = []
+    for vid in vehs[:50]:
+        try:
+            x, y = traci.vehicle.getPosition(vid)
+            xs.append(float(x))
+            ys.append(float(y))
+        except Exception:
+            continue
+    if not xs:
+        return False
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    if xmax - xmin < pad_m:
+        cx = 0.5 * (xmin + xmax)
+        xmin, xmax = cx - pad_m * 0.5, cx + pad_m * 0.5
+    if ymax - ymin < pad_m:
+        cy = 0.5 * (ymin + ymax)
+        ymin, ymax = cy - pad_m * 0.5, cy + pad_m * 0.5
+    try:
+        traci.gui.setBoundary(
+            view_id,
+            xmin - pad_m * 0.25,
+            ymin - pad_m * 0.25,
+            xmax + pad_m * 0.25,
+            ymax + pad_m * 0.25,
+        )
+        try:
+            traci.gui.trackVehicle(view_id, vehs[0])
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _zoom_gui_to_network(cfg_path: Path, view_id: str = "View #0") -> None:
+    """Zoom sumo-gui to the central part of the network (vehicles stay visible)."""
+    try:
+        import sumolib
+        import traci
+    except Exception:
+        return
+    try:
+        tree = ET.parse(cfg_path)
+        net_el = tree.find("./input/net-file")
+        if net_el is None or not net_el.get("value"):
+            return
+        net_path = Path(net_el.get("value", ""))
+        if not net_path.is_file():
+            return
+        net = sumolib.net.readNet(str(net_path))
+        xmin, ymin, xmax, ymax = net.getBoundary()
+        # Full-network fit makes cars look like dust; show ~35% around center.
+        cx = 0.5 * (xmin + xmax)
+        cy = 0.5 * (ymin + ymax)
+        half_w = max(80.0, (xmax - xmin) * 0.175)
+        half_h = max(80.0, (ymax - ymin) * 0.175)
+        traci.gui.setBoundary(
+            view_id,
+            cx - half_w,
+            cy - half_h,
+            cx + half_w,
+            cy + half_h,
+        )
+    except Exception:
+        return
+
+
+def _capture_hwnd_png(hwnd: int, dest: Path) -> bool:
+    """Grab sumo-gui via OS capture (avoids TraCI screenshot freeze on Windows)."""
+    if sys.platform != "win32" or not hwnd:
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    # Match screen coords used by ImageGrab under DPI scaling.
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return False
+    left, top, right, bottom = (
+        int(rect.left),
+        int(rect.top),
+        int(rect.right),
+        int(rect.bottom),
+    )
+    width = right - left
+    height = bottom - top
+    if width < 50 or height < 50:
+        return False
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    # PrintWindow → raw BGRA (works when ImageGrab gets a black OpenGL surface).
+    try:
+        hwnd_dc = user32.GetWindowDC(hwnd)
+        mem_dc = gdi32.CreateCompatibleDC(hwnd_dc)
+        bmp = gdi32.CreateCompatibleBitmap(hwnd_dc, width, height)
+        gdi32.SelectObject(mem_dc, bmp)
+        if user32.PrintWindow(hwnd, mem_dc, 2) or user32.PrintWindow(hwnd, mem_dc, 0):
+
+            class BITMAPINFOHEADER(ctypes.Structure):
+                _fields_ = [
+                    ("biSize", wintypes.DWORD),
+                    ("biWidth", wintypes.LONG),
+                    ("biHeight", wintypes.LONG),
+                    ("biPlanes", wintypes.WORD),
+                    ("biBitCount", wintypes.WORD),
+                    ("biCompression", wintypes.DWORD),
+                    ("biSizeImage", wintypes.DWORD),
+                    ("biXPelsPerMeter", wintypes.LONG),
+                    ("biYPelsPerMeter", wintypes.LONG),
+                    ("biClrUsed", wintypes.DWORD),
+                    ("biClrImportant", wintypes.DWORD),
+                ]
+
+            bmi = BITMAPINFOHEADER()
+            bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            bmi.biWidth = width
+            bmi.biHeight = -height  # top-down
+            bmi.biPlanes = 1
+            bmi.biBitCount = 32
+            bmi.biCompression = 0
+            buf = ctypes.create_string_buffer(width * height * 4)
+            bits = gdi32.GetDIBits(mem_dc, bmp, 0, height, buf, ctypes.byref(bmi), 0)
+            if bits:
+                from PIL import Image
+
+                img = Image.frombuffer("RGBA", (width, height), buf, "raw", "BGRA", 0, 1).convert(
+                    "RGB"
+                )
+                img.save(dest, format="PNG")
+                gdi32.DeleteObject(bmp)
+                gdi32.DeleteDC(mem_dc)
+                user32.ReleaseDC(hwnd, hwnd_dc)
+                return dest.exists() and dest.stat().st_size > 1000
+        gdi32.DeleteObject(bmp)
+        gdi32.DeleteDC(mem_dc)
+        user32.ReleaseDC(hwnd, hwnd_dc)
+    except Exception:
+        pass
+
+    try:
+        from PIL import ImageGrab
+    except ImportError:
+        return False
+    try:
+        try:
+            img = ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True)
+        except TypeError:
+            img = ImageGrab.grab(bbox=(left, top, right, bottom))
+        img.save(dest, format="PNG")
+        return dest.exists() and dest.stat().st_size > 1000
+    except Exception:
+        return False
 
 
 def run_simulation(
@@ -211,6 +534,7 @@ def run_simulation(
     video_path: Optional[Path] = None,
     video_fps: float = 5.0,
     screenshot_size: tuple[int, int] = (1280, 720),
+    progress_cb: Optional[Any] = None,
 ) -> SimResult:
     sumo = sumo or detect_sumo()
     if not sumo.ok or not sumo.sumo_bin:
@@ -234,11 +558,14 @@ def run_simulation(
     else:
         bin_path = sumo.sumo_bin
 
+    # SUMO 1.27 + Windows: traci.gui.screenshot often freezes simulationStep.
+    # Open GUI for display; capture frames with OS window grab instead.
     cmd = [
         str(bin_path),
         "-c",
         str(cfg_safe),
         "--start",
+        "true",
         "--quit-on-end",
         "true",
         "--no-warnings",
@@ -247,10 +574,24 @@ def run_simulation(
         "0.1",
     ]
     if use_gui:
-        cmd.extend(["--window-size", f"{screenshot_size[0]},{screenshot_size[1]}"])
+        settings_dir = Path(frames_dir).parent if frames_dir else (SAFE_RUNS / "current")
+        gui_settings = _write_record_gui_settings(settings_dir / "viewsettings_record.xml")
+        cmd.extend(
+            [
+                "--gui-settings-file",
+                str(gui_settings),
+                "--delay",
+                "100",
+                "--window-size",
+                f"{int(screenshot_size[0])},{int(screenshot_size[1])}",
+            ]
+        )
 
     frames_path: Optional[Path] = None
     frame_i = 0
+    gui_hwnd: Optional[int] = None
+    gui_pid: Optional[int] = None
+    capture_failures = 0
     if use_gui:
         frames_path = Path(frames_dir) if frames_dir else (SAFE_RUNS / "current" / "frames")
         if not path_is_safe(frames_path):
@@ -277,13 +618,30 @@ def run_simulation(
 
     traci.switch(label)
 
+    if use_gui:
+        gui_pid = _traci_sumo_pid(label)
+        time.sleep(0.8)
+        gui_hwnd = _find_sumo_gui_hwnd(gui_pid)
+        # Fit view to full network so cars are not off-camera.
+        try:
+            traci.simulationStep()
+        except traci.TraCIException:
+            pass
+        _zoom_gui_to_network(cfg_safe)
+        try:
+            traci.simulationStep()
+        except traci.TraCIException:
+            pass
+        # Re-resolve HWND after window is fully up.
+        gui_hwnd = _find_sumo_gui_hwnd(gui_pid) or gui_hwnd
+
     if edge_levels:
         for eid, level in edge_levels.items():
             try:
                 traci.edge.setMaxSpeed(eid, desired_speed_ms(level, CITY_MAX_SPEED_MS))
             except traci.TraCIException:
                 continue
-    else:
+    elif not use_gui:
         try:
             for eid in traci.edge.getIDList():
                 if eid.startswith(":"):
@@ -301,12 +659,6 @@ def run_simulation(
         except traci.TraCIException:
             pass
 
-    if use_gui:
-        try:
-            traci.gui.setSchema("View #0", "real world")
-        except traci.TraCIException:
-            pass
-
     edge_acc: dict[str, dict[str, float]] = {}
     vehicle_steps = 0
     total_waiting = 0.0
@@ -315,7 +667,7 @@ def run_simulation(
     warmup = max(0.0, float(warmup_s))
     every = max(1.0, float(record_every_s))
     next_shot_at = 0.0
-    tracked = False
+    last_progress_t = -1e9
 
     try:
         end = float(traci.simulation.getEndTime())
@@ -326,33 +678,66 @@ def run_simulation(
     if warmup >= end * 0.85:
         warmup = max(0.0, end * 0.2)
 
+    def _os_capture(sim_t: float) -> None:
+        nonlocal frame_i, next_shot_at, gui_hwnd, capture_failures
+        if frames_path is None or sim_t + 1e-9 < next_shot_at:
+            return
+        # Do not capture an empty network: wait until TraCI reports vehicles,
+        # then aim the camera at them and give the GUI time to paint.
+        try:
+            n_veh = len(traci.vehicle.getIDList())
+        except Exception:
+            n_veh = 0
+        if n_veh <= 0:
+            return
+        next_shot_at = sim_t + every
+        focused = _focus_gui_on_traffic()
+        if not focused:
+            capture_failures += 1
+            return
+        # Extra step + pause so sumo-gui redraws vehicles in the new viewport
+        # (otherwise OS grabs show roads without cars while KPIs are fine).
+        try:
+            traci.simulationStep()
+        except traci.TraCIException:
+            pass
+        time.sleep(0.18)
+        if gui_hwnd is None:
+            gui_hwnd = _find_sumo_gui_hwnd(gui_pid)
+        if not gui_hwnd:
+            capture_failures += 1
+            return
+        title = _hwnd_title(gui_hwnd) if sys.platform == "win32" else ""
+        if title and not _is_sumo_gui_window_title(title) and not gui_pid:
+            capture_failures += 1
+            gui_hwnd = None
+            return
+        shot = frames_path / f"frame_{frame_i:06d}.png"
+        if _capture_hwnd_png(gui_hwnd, shot):
+            frame_i += 1
+        else:
+            capture_failures += 1
+            gui_hwnd = None
+
     try:
         t = 0.0
         while t < end:
-            if use_gui and frames_path is not None and t + 1e-9 >= next_shot_at:
-                shot = frames_path / f"frame_{frame_i:06d}.png"
-                try:
-                    traci.gui.screenshot(
-                        "View #0",
-                        str(shot).replace("\\", "/"),
-                        int(screenshot_size[0]),
-                        int(screenshot_size[1]),
-                    )
-                    frame_i += 1
-                    next_shot_at = t + every
-                except traci.TraCIException:
-                    next_shot_at = t + every
-
             traci.simulationStep()
             t = float(traci.simulation.getTime())
 
-            if use_gui and not tracked:
+            if use_gui:
+                _os_capture(t)
+                # Keep local time in sync if capture advanced an extra step.
                 try:
-                    vehs = traci.vehicle.getIDList()
-                    if vehs:
-                        traci.gui.trackVehicle("View #0", vehs[0])
-                        tracked = True
-                except traci.TraCIException:
+                    t = float(traci.simulation.getTime())
+                except Exception:
+                    pass
+
+            if progress_cb is not None and (t - last_progress_t) >= 5.0:
+                last_progress_t = t
+                try:
+                    progress_cb(t, end, frame_i)
+                except Exception:
                     pass
 
             if t < warmup:
@@ -388,12 +773,6 @@ def run_simulation(
                         continue
                     edge_acc[eid]["occ"] += occ
                     edge_acc[eid]["max_occ"] = max(edge_acc[eid]["max_occ"], occ)
-
-        if use_gui and frame_i > 0:
-            try:
-                traci.simulationStep()
-            except traci.TraCIException:
-                pass
     finally:
         try:
             traci.close(wait=False)
@@ -455,6 +834,11 @@ def run_simulation(
             out_video = str(dest_video)
         except Exception as e:
             video_note = f"; video: {e}"
+    elif use_gui and frame_i == 0:
+        video_note = (
+            f"; video: sin frames (ventana sumo-gui no capturable; fallos={capture_failures}). "
+            "Deje la ventana visible y no minimice."
+        )
 
     result = SimResult(
         duration_s=int(end),
