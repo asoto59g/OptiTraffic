@@ -328,13 +328,13 @@ def _find_sumo_gui_hwnd(pid: Optional[int] = None) -> Optional[int]:
 
 
 def _write_record_gui_settings(path: Path) -> Path:
-    """GUI settings for recording: near real-scale vehicles on the street grid."""
+    """GUI settings for recording: readable vehicles without cartoon sizing."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         """<?xml version="1.0" encoding="UTF-8"?>
 <viewsettings>
     <scheme name="real world">
-        <vehicles vehicle_exaggeration="1.2" vehicle_minSize="1" vehicle_constantSize="0"
+        <vehicles vehicle_exaggeration="2.5" vehicle_minSize="3" vehicle_constantSize="0"
                   vehicle_quality="2" showBlinker="0"/>
         <persons person_exaggeration="1" person_minSize="1" person_constantSize="0"/>
         <edges edge_exaggeration="1.0"/>
@@ -347,8 +347,8 @@ def _write_record_gui_settings(path: Path) -> Path:
     return path
 
 
-def _focus_gui_on_traffic(view_id: str = "View #0", *, pad_m: float = 280.0) -> bool:
-    """Zoom to a street corridor around traffic (real scale, not vehicle close-up)."""
+def _focus_gui_on_traffic(view_id: str = "View #0", *, pad_m: float = 160.0) -> bool:
+    """Zoom to a street block around traffic so real-scale cars stay visible in frames."""
     try:
         import traci
     except Exception:
@@ -361,7 +361,7 @@ def _focus_gui_on_traffic(view_id: str = "View #0", *, pad_m: float = 280.0) -> 
         return False
     xs: list[float] = []
     ys: list[float] = []
-    for vid in vehs[:80]:
+    for vid in vehs[:60]:
         try:
             x, y = traci.vehicle.getPosition(vid)
             xs.append(float(x))
@@ -370,24 +370,19 @@ def _focus_gui_on_traffic(view_id: str = "View #0", *, pad_m: float = 280.0) -> 
             continue
     if not xs:
         return False
-    xmin, xmax = min(xs), max(xs)
-    ymin, ymax = min(ys), max(ys)
-    # Neighborhood-sized window so streets read clearly at real vehicle size.
-    min_span = max(pad_m, 220.0)
-    if xmax - xmin < min_span:
-        cx = 0.5 * (xmin + xmax)
-        xmin, xmax = cx - min_span * 0.5, cx + min_span * 0.5
-    if ymax - ymin < min_span:
-        cy = 0.5 * (ymin + ymax)
-        ymin, ymax = cy - min_span * 0.5, cy + min_span * 0.5
-    margin = max(40.0, min_span * 0.08)
+    # Prefer densest local cluster (median) so we do not zoom out to the whole city.
+    xs_s = sorted(xs)
+    ys_s = sorted(ys)
+    mid = len(xs_s) // 2
+    cx, cy = xs_s[mid], ys_s[mid]
+    half = max(70.0, pad_m * 0.5)
     try:
         traci.gui.setBoundary(
             view_id,
-            xmin - margin,
-            ymin - margin,
-            xmax + margin,
-            ymax + margin,
+            cx - half,
+            cy - half,
+            cx + half,
+            cy + half,
         )
         return True
     except Exception:
@@ -395,7 +390,7 @@ def _focus_gui_on_traffic(view_id: str = "View #0", *, pad_m: float = 280.0) -> 
 
 
 def _zoom_gui_to_network(cfg_path: Path, view_id: str = "View #0") -> None:
-    """Initial neighborhood zoom (~45% of network) until traffic appears."""
+    """Initial street-block zoom (~25% of network) until traffic appears."""
     try:
         import sumolib
         import traci
@@ -413,8 +408,8 @@ def _zoom_gui_to_network(cfg_path: Path, view_id: str = "View #0") -> None:
         xmin, ymin, xmax, ymax = net.getBoundary()
         cx = 0.5 * (xmin + xmax)
         cy = 0.5 * (ymin + ymax)
-        half_w = max(150.0, (xmax - xmin) * 0.225)
-        half_h = max(150.0, (ymax - ymin) * 0.225)
+        half_w = max(120.0, (xmax - xmin) * 0.125)
+        half_h = max(120.0, (ymax - ymin) * 0.125)
         traci.gui.setBoundary(
             view_id,
             cx - half_w,
@@ -427,13 +422,12 @@ def _zoom_gui_to_network(cfg_path: Path, view_id: str = "View #0") -> None:
 
 
 def _capture_hwnd_png(hwnd: int, dest: Path) -> bool:
-    """Grab sumo-gui via OS capture (avoids TraCI screenshot freeze on Windows)."""
+    """Grab what is on-screen in sumo-gui (ImageGrab first — matches what the eye sees)."""
     if sys.platform != "win32" or not hwnd:
         return False
     import ctypes
     from ctypes import wintypes
 
-    # Match screen coords used by ImageGrab under DPI scaling.
     try:
         ctypes.windll.user32.SetProcessDPIAware()
     except Exception:
@@ -457,13 +451,41 @@ def _capture_hwnd_png(hwnd: int, dest: Path) -> bool:
 
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    # PrintWindow → raw BGRA (works when ImageGrab gets a black OpenGL surface).
+    # Raise window so the grab matches the live OpenGL view the user sees.
+    try:
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+    time.sleep(0.05)
+
+    # Prefer screen grab: PrintWindow often omits / flattens OpenGL vehicles.
+    try:
+        from PIL import ImageGrab
+    except ImportError:
+        log.debug("Pillow no disponible: no se puede grabar video de sumo-gui")
+        ImageGrab = None  # type: ignore[assignment]
+
+    if ImageGrab is not None:
+        try:
+            try:
+                img = ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True)
+            except TypeError:
+                img = ImageGrab.grab(bbox=(left, top, right, bottom))
+            img.save(dest, format="PNG")
+            if dest.exists() and dest.stat().st_size > 1000:
+                return True
+        except Exception:
+            log.debug("ImageGrab falló para hwnd %s", hwnd, exc_info=True)
+
+    # Fallback: PrintWindow (may miss OpenGL vehicle layer on some GPUs).
     try:
         hwnd_dc = user32.GetWindowDC(hwnd)
         mem_dc = gdi32.CreateCompatibleDC(hwnd_dc)
         bmp = gdi32.CreateCompatibleBitmap(hwnd_dc, width, height)
         gdi32.SelectObject(mem_dc, bmp)
-        if user32.PrintWindow(hwnd, mem_dc, 2) or user32.PrintWindow(hwnd, mem_dc, 0):
+        ok = bool(user32.PrintWindow(hwnd, mem_dc, 2) or user32.PrintWindow(hwnd, mem_dc, 0))
+        if ok:
 
             class BITMAPINFOHEADER(ctypes.Structure):
                 _fields_ = [
@@ -483,7 +505,7 @@ def _capture_hwnd_png(hwnd: int, dest: Path) -> bool:
             bmi = BITMAPINFOHEADER()
             bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
             bmi.biWidth = width
-            bmi.biHeight = -height  # top-down
+            bmi.biHeight = -height
             bmi.biPlanes = 1
             bmi.biBitCount = 32
             bmi.biCompression = 0
@@ -504,23 +526,8 @@ def _capture_hwnd_png(hwnd: int, dest: Path) -> bool:
         gdi32.DeleteDC(mem_dc)
         user32.ReleaseDC(hwnd, hwnd_dc)
     except Exception:
-        pass
-
-    try:
-        from PIL import ImageGrab
-    except ImportError:
-        log.debug("Pillow no disponible: no se puede grabar video de sumo-gui")
-        return False
-    try:
-        try:
-            img = ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True)
-        except TypeError:
-            img = ImageGrab.grab(bbox=(left, top, right, bottom))
-        img.save(dest, format="PNG")
-        return dest.exists() and dest.stat().st_size > 1000
-    except Exception:
-        log.debug("Captura de hwnd %s falló (PrintWindow e ImageGrab)", hwnd, exc_info=True)
-        return False
+        log.debug("PrintWindow falló para hwnd %s", hwnd, exc_info=True)
+    return False
 
 
 def run_simulation(
