@@ -21,6 +21,7 @@ load_dotenv(_ROOT / ".env")
 class SumoEnv:
     home: Optional[Path]
     sumo_bin: Optional[Path]
+    sumo_gui_bin: Optional[Path]
     netconvert_bin: Optional[Path]
     tools_dir: Optional[Path]
     ok: bool
@@ -82,18 +83,21 @@ def detect_sumo() -> SumoEnv:
         os.environ["SUMO_HOME"] = str(home)
 
     sumo_bin = _find_bin("sumo", home)
+    sumo_gui_bin = _find_bin("sumo-gui", home)
     netconvert_bin = _find_bin("netconvert", home)
     tools_dir = (home / "tools") if home and (home / "tools").is_dir() else None
     libs_ok = ensure_sumolib_on_path(home)
 
     if sumo_bin and netconvert_bin and libs_ok:
+        gui_note = f", gui={sumo_gui_bin.name}" if sumo_gui_bin else " (sin sumo-gui)"
         return SumoEnv(
             home=home,
             sumo_bin=sumo_bin,
+            sumo_gui_bin=sumo_gui_bin,
             netconvert_bin=netconvert_bin,
             tools_dir=tools_dir,
             ok=True,
-            message=f"SUMO listo ({sumo_bin})",
+            message=f"SUMO listo ({sumo_bin.name}{gui_note})",
         )
 
     missing = []
@@ -106,6 +110,7 @@ def detect_sumo() -> SumoEnv:
     return SumoEnv(
         home=home,
         sumo_bin=sumo_bin,
+        sumo_gui_bin=sumo_gui_bin,
         netconvert_bin=netconvert_bin,
         tools_dir=tools_dir,
         ok=False,

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import csv
 import json
+import shutil
+import subprocess
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
@@ -37,6 +39,9 @@ class SimResult:
     pct_edges_congested: float
     edges: dict[str, EdgeKPI] = field(default_factory=dict)
     tomtom_correlation: Optional[float] = None
+    video_path: Optional[str] = None
+    frames_dir: Optional[str] = None
+    frames_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -150,6 +155,48 @@ def _sumo_stderr_probe(sumo_bin: Path, cfg_path: Path) -> str:
     return " | ".join(lines[:6])
 
 
+def find_ffmpeg() -> Optional[Path]:
+    which = shutil.which("ffmpeg")
+    return Path(which) if which else None
+
+
+def encode_frames_to_mp4(
+    frames_dir: Path,
+    out_path: Path,
+    *,
+    fps: float = 5.0,
+) -> Path:
+    """Assemble frame_XXXXXX.png into an H.264 MP4 via ffmpeg."""
+    ffmpeg = find_ffmpeg()
+    if ffmpeg is None:
+        raise FileNotFoundError(
+            "ffmpeg no está en PATH. Instálelo o use solo los PNG en la carpeta de frames."
+        )
+    pattern = str(frames_dir / "frame_%06d.png")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(ffmpeg),
+        "-y",
+        "-framerate",
+        str(fps),
+        "-i",
+        pattern,
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(out_path),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if r.returncode != 0 or not out_path.exists():
+        raise RuntimeError(
+            "ffmpeg falló al crear el video:\n" + (r.stderr or r.stdout or "sin detalle")[:800]
+        )
+    return out_path
+
+
 def run_simulation(
     cfg_path: Path,
     sumo: Optional[SumoEnv] = None,
@@ -157,6 +204,13 @@ def run_simulation(
     speed_cong_threshold: float = CONGESTION_SPEED_MS,
     edge_levels: Optional[dict[str, float]] = None,
     warmup_s: float = 0.0,
+    *,
+    record_video: bool = False,
+    record_every_s: float = 10.0,
+    frames_dir: Optional[Path] = None,
+    video_path: Optional[Path] = None,
+    video_fps: float = 5.0,
+    screenshot_size: tuple[int, int] = (1280, 720),
 ) -> SimResult:
     sumo = sumo or detect_sumo()
     if not sumo.ok or not sumo.sumo_bin:
@@ -168,8 +222,20 @@ def run_simulation(
     _close_traci(label)
 
     cfg_safe = cfg_path if path_is_safe(cfg_path) else to_safe_path(cfg_path)
+
+    use_gui = bool(record_video)
+    if use_gui:
+        if not getattr(sumo, "sumo_gui_bin", None):
+            raise RuntimeError(
+                "Grabar video requiere sumo-gui. Instale SUMO con interfaz gráfica "
+                "y verifique que `sumo-gui` esté en PATH / SUMO_HOME/bin."
+            )
+        bin_path = sumo.sumo_gui_bin
+    else:
+        bin_path = sumo.sumo_bin
+
     cmd = [
-        str(sumo.sumo_bin),
+        str(bin_path),
         "-c",
         str(cfg_safe),
         "--start",
@@ -180,6 +246,21 @@ def run_simulation(
         "--default.speeddev",
         "0.1",
     ]
+    if use_gui:
+        cmd.extend(["--window-size", f"{screenshot_size[0]},{screenshot_size[1]}"])
+
+    frames_path: Optional[Path] = None
+    frame_i = 0
+    if use_gui:
+        frames_path = Path(frames_dir) if frames_dir else (SAFE_RUNS / "current" / "frames")
+        if not path_is_safe(frames_path):
+            frames_path = to_safe_path(frames_path)
+        frames_path.mkdir(parents=True, exist_ok=True)
+        for old in frames_path.glob("frame_*.png"):
+            try:
+                old.unlink()
+            except OSError:
+                pass
 
     try:
         traci.start(cmd, label=label)
@@ -189,15 +270,13 @@ def run_simulation(
         try:
             traci.start(cmd, label=label)
         except Exception as e2:
-            detail = _sumo_stderr_probe(sumo.sumo_bin, cfg_safe)
+            detail = _sumo_stderr_probe(bin_path, cfg_safe)
             raise RuntimeError(
                 f"No se pudo iniciar SUMO/TraCI: {e2}. Detalle SUMO: {detail}"
             ) from e2
 
     traci.switch(label)
 
-    # Peak-hour: reduce edge allowed speed from TomTom relative speed (level 1 = free).
-    # Note: TraCI has edge.setMaxSpeed but NOT edge.getMaxSpeed (use lane.getMaxSpeed).
     if edge_levels:
         for eid, level in edge_levels.items():
             try:
@@ -205,7 +284,6 @@ def run_simulation(
             except traci.TraCIException:
                 continue
     else:
-        # Enforce municipal cap (net.xml should already be capped; set is idempotent).
         try:
             for eid in traci.edge.getIDList():
                 if eid.startswith(":"):
@@ -223,12 +301,21 @@ def run_simulation(
         except traci.TraCIException:
             pass
 
+    if use_gui:
+        try:
+            traci.gui.setSchema("View #0", "real world")
+        except traci.TraCIException:
+            pass
+
     edge_acc: dict[str, dict[str, float]] = {}
     vehicle_steps = 0
     total_waiting = 0.0
     speed_samples = 0.0
     speed_sum = 0.0
     warmup = max(0.0, float(warmup_s))
+    every = max(1.0, float(record_every_s))
+    next_shot_at = 0.0
+    tracked = False
 
     try:
         end = float(traci.simulation.getEndTime())
@@ -236,18 +323,38 @@ def run_simulation(
         end = 1800.0
     if end <= 0 or end > 1e7:
         end = 1800.0
-    # Warmup cannot eat the whole run
     if warmup >= end * 0.85:
         warmup = max(0.0, end * 0.2)
 
     try:
-        while True:
+        t = 0.0
+        while t < end:
+            if use_gui and frames_path is not None and t + 1e-9 >= next_shot_at:
+                shot = frames_path / f"frame_{frame_i:06d}.png"
+                try:
+                    traci.gui.screenshot(
+                        "View #0",
+                        str(shot).replace("\\", "/"),
+                        int(screenshot_size[0]),
+                        int(screenshot_size[1]),
+                    )
+                    frame_i += 1
+                    next_shot_at = t + every
+                except traci.TraCIException:
+                    next_shot_at = t + every
+
             traci.simulationStep()
             t = float(traci.simulation.getTime())
-            if t >= end:
-                break
 
-            # Let the network fill before KPIs (stabilization)
+            if use_gui and not tracked:
+                try:
+                    vehs = traci.vehicle.getIDList()
+                    if vehs:
+                        traci.gui.trackVehicle("View #0", vehs[0])
+                        tracked = True
+                except traci.TraCIException:
+                    pass
+
             if t < warmup:
                 continue
 
@@ -281,6 +388,12 @@ def run_simulation(
                         continue
                     edge_acc[eid]["occ"] += occ
                     edge_acc[eid]["max_occ"] = max(edge_acc[eid]["max_occ"], occ)
+
+        if use_gui and frame_i > 0:
+            try:
+                traci.simulationStep()
+            except traci.TraCIException:
+                pass
     finally:
         try:
             traci.close(wait=False)
@@ -328,6 +441,21 @@ def run_simulation(
 
     mean_speed = (speed_sum / speed_samples) if speed_samples else 0.0
     pct = (100.0 * congested / len(edges)) if edges else 0.0
+
+    out_video: Optional[str] = None
+    frames_count = frame_i
+    frames_dir_str = str(frames_path) if frames_path else None
+    video_note = ""
+    if use_gui and frames_path and frame_i > 0:
+        dest_video = Path(video_path) if video_path else (frames_path.parent / "simulation.mp4")
+        if not path_is_safe(dest_video):
+            dest_video = to_safe_path(dest_video)
+        try:
+            encode_frames_to_mp4(frames_path, dest_video, fps=float(video_fps))
+            out_video = str(dest_video)
+        except Exception as e:
+            video_note = f"; video: {e}"
+
     result = SimResult(
         duration_s=int(end),
         vehicle_steps=vehicle_steps,
@@ -336,9 +464,11 @@ def run_simulation(
         pct_edges_congested=pct,
         edges=edges,
         tomtom_correlation=corr,
+        video_path=out_video,
+        frames_dir=frames_dir_str,
+        frames_count=frames_count,
     )
-    # Stash diagnostic for UI (not part of dataclass to keep exports stable)
-    result._corr_detail = corr_detail  # type: ignore[attr-defined]
+    result._corr_detail = corr_detail + video_note  # type: ignore[attr-defined]
     result._warmup_s = warmup  # type: ignore[attr-defined]
     return result
 

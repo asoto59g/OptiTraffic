@@ -34,6 +34,7 @@ from src.simulate import (  # noqa: E402
     _close_traci,
     export_edge_csv,
     export_edge_geojson,
+    find_ffmpeg,
     run_simulation,
     write_sumocfg,
 )
@@ -424,6 +425,59 @@ def step_sim() -> None:
         f"Medición de KPIs: {int(duration - warmup)} s útiles tras {int(warmup)} s de llenado."
     )
 
+    st.markdown("**Grabación de video**")
+    gui_ok = bool(getattr(sumo, "sumo_gui_bin", None))
+    ff_ok = find_ffmpeg() is not None
+    if not gui_ok:
+        st.caption("sumo-gui no detectado: la grabación no está disponible.")
+    elif not ff_ok:
+        st.caption(
+            "ffmpeg no está en PATH: se guardarán PNG; el MP4 se puede generar después."
+        )
+    record_video = st.checkbox(
+        "Grabar video (sumo-gui)",
+        value=False,
+        key="record_video",
+        disabled=not gui_ok,
+        help=(
+            "Abre sumo-gui, captura pantallas cada N segundos de simulación y "
+            "arma un MP4 con ffmpeg. Más lento que sumo headless."
+        ),
+    )
+    record_every = 10.0
+    video_fps = 5.0
+    if record_video and gui_ok:
+        rc1, rc2 = st.columns(2)
+        with rc1:
+            record_every = float(
+                st.slider(
+                    "Intervalo de captura (s sim)",
+                    5,
+                    60,
+                    10,
+                    5,
+                    key="record_every_s",
+                    help="5–10 s suele bastar para un video corto y legible.",
+                )
+            )
+        with rc2:
+            video_fps = float(
+                st.slider(
+                    "FPS del MP4",
+                    2,
+                    15,
+                    5,
+                    1,
+                    key="video_fps",
+                    help="Cuadros por segundo al ensamblar el video.",
+                )
+            )
+        n_est = max(1, int(duration / record_every))
+        st.caption(
+            f"≈ {n_est} capturas · ventana GUI 1280×720 · "
+            f"{'MP4 al final' if ff_ok else 'solo PNG (sin ffmpeg)'}"
+        )
+
     base_rate = st.slider(
         f"Densidad base (solo si no hay puertas) — {dens.label}",
         dens.per_dir_min,
@@ -481,15 +535,25 @@ def step_sim() -> None:
                 end=int(duration),
             )
             status.info(
-                f"Ejecutando SUMO ({duration}s · warmup {warmup}s)… "
-                "puede tardar varios minutos."
+                f"Ejecutando SUMO ({duration}s · warmup {warmup}s"
+                + (" · grabando video" if record_video else "")
+                + ")… puede tardar varios minutos."
             )
-            with st.spinner("Ejecutando SUMO (TraCI)…"):
+            with st.spinner(
+                "Ejecutando SUMO-GUI + capturas…"
+                if record_video
+                else "Ejecutando SUMO (TraCI)…"
+            ):
                 result = run_simulation(
                     cfg,
                     sumo=sumo,
                     edge_levels=st.session_state.edge_levels or None,
                     warmup_s=float(warmup),
+                    record_video=bool(record_video and gui_ok),
+                    record_every_s=float(record_every),
+                    frames_dir=run_dir / "frames",
+                    video_path=run_dir / "simulation.mp4",
+                    video_fps=float(video_fps),
                 )
             st.session_state.sim_result = result
             export_edge_csv(result, run_dir / "edges.csv")
@@ -509,16 +573,24 @@ def step_sim() -> None:
                         "warmup_s": int(warmup),
                         "flow_gates": gates_to_list(gates),
                         "demand_mode": "gates" if gates else "seed",
+                        "record_video": bool(record_video and gui_ok),
+                        "video_path": result.video_path,
+                        "frames_count": result.frames_count,
                     },
                     indent=2,
                 ),
                 encoding="utf-8",
             )
             _bump_map()
+            vid_msg = ""
+            if result.video_path:
+                vid_msg = f" · video={Path(result.video_path).name}"
+            elif result.frames_count:
+                vid_msg = f" · {result.frames_count} frames PNG"
             status.success(
                 f"Simulación OK · veh-steps={result.vehicle_steps} · "
                 f"v_media={result.mean_speed:.2f} m/s · modo="
-                f"{'puertas' if gates else 'repartido'}"
+                f"{'puertas' if gates else 'repartido'}{vid_msg}"
             )
             go_to(STEPS[5])
         except Exception as e:

@@ -62,7 +62,7 @@ streamlit run app.py
 | **2. Red OSM→SUMO** | Overpass (rápido) o Geofabrik (país, **tope 500 MB**) → recorte → `netconvert` → mapa de edges. |
 | **3. Configuración** | Clic en **cruces** (semáforos) o **calles** (alto/parqueo/carriles). Guardar/cargar config ligada al polígono. |
 | **4. TomTom** | Flow tiles o **calibración sintética** (CR sin cobertura TomTom Flow). |
-| **5. Simulación** | **Entradas/salidas** de flujo + warmup; demanda OD; duración larga; KPIs. |
+| **5. Simulación** | **Entradas/salidas** de flujo + warmup; demanda OD; duración larga; KPIs; opcional **Grabar video (sumo-gui)** → PNG + MP4 (ffmpeg). |
 | **6. Resultados** | Mapa de congestión, CSV/GeoJSON, guardar escenario completo. |
 
 ---

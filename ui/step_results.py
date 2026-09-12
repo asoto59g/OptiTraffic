@@ -86,9 +86,29 @@ def step_results() -> None:
             file_name="edges_result.geojson",
         )
 
+    video_path = getattr(result, "video_path", None)
+    frames_dir = getattr(result, "frames_dir", None)
+    frames_count = int(getattr(result, "frames_count", 0) or 0)
+    if video_path and Path(video_path).exists():
+        st.download_button(
+            "Descargar video (MP4)",
+            Path(video_path).read_bytes(),
+            file_name="simulation.mp4",
+            mime="video/mp4",
+        )
+        st.caption(f"Video: `{video_path}` · {frames_count} frames")
+    elif frames_count and frames_dir:
+        st.info(
+            f"Hay **{frames_count}** capturas PNG en `{frames_dir}` "
+            "(ffmpeg no generó MP4 o no está instalado)."
+        )
+
     name = st.text_input("Nombre del escenario", value=f"{st.session_state.city}_mvp")
     overwrite = st.checkbox("Sobrescribir si existe el mismo nombre", value=False, key="res_overwrite")
     if st.button("Guardar escenario (zona + config + resultados)", type="primary"):
+        extras = [p for p in (csv_path, gj_path) if p.exists()]
+        if video_path and Path(video_path).exists():
+            extras.append(Path(video_path))
         folder = save_scenario(
             name,
             st.session_state.area,
@@ -102,8 +122,10 @@ def step_results() -> None:
                 "mean_speed": result.mean_speed,
                 "pct_edges_congested": result.pct_edges_congested,
                 "tomtom_correlation": result.tomtom_correlation,
+                "video_path": video_path,
+                "frames_count": frames_count,
             },
-            extra_files=[csv_path, gj_path] if csv_path.exists() else None,
+            extra_files=extras or None,
             overwrite=overwrite,
         )
         st.session_state.scenario_folder = str(folder)
