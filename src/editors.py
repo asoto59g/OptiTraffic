@@ -38,12 +38,23 @@ class StopSign:
 
 
 @dataclass
+class TlsPlacement:
+    """User-confirmed traffic light at an intersection / edge (MVP)."""
+
+    edge_id: str
+    tls_id: Optional[str] = None  # existing SUMO TLS if known
+    junction_id: Optional[str] = None
+    name: str = ""
+
+
+@dataclass
 class NetworkEdits:
     tls_default: TlsTiming = field(default_factory=TlsTiming)
     tls_overrides: dict[str, TlsTiming] = field(default_factory=dict)
     lane_overrides: list[LaneOverride] = field(default_factory=list)
     parking: list[ParkingConfig] = field(default_factory=list)
     stops: list[StopSign] = field(default_factory=list)
+    tls_placements: list[TlsPlacement] = field(default_factory=list)
     min_width_both_sides_m: float = 9.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -53,6 +64,7 @@ class NetworkEdits:
             "lane_overrides": [asdict(x) for x in self.lane_overrides],
             "parking": [asdict(x) for x in self.parking],
             "stops": [asdict(x) for x in self.stops],
+            "tls_placements": [asdict(x) for x in self.tls_placements],
             "min_width_both_sides_m": self.min_width_both_sides_m,
         }
 
@@ -66,6 +78,7 @@ class NetworkEdits:
         edits.lane_overrides = [LaneOverride(**x) for x in d.get("lane_overrides") or []]
         edits.parking = [ParkingConfig(**x) for x in d.get("parking") or []]
         edits.stops = [StopSign(**x) for x in d.get("stops") or []]
+        edits.tls_placements = [TlsPlacement(**x) for x in d.get("tls_placements") or []]
         edits.min_width_both_sides_m = float(d.get("min_width_both_sides_m", 9.0))
         return edits
 
@@ -83,18 +96,64 @@ def _indent(elem: ET.Element, level: int = 0) -> None:
         elem.tail = i
 
 
+def _phase_kind(state: str) -> str:
+    """Classify a SUMO TLS phase by its state string."""
+    s = state or ""
+    if any(c in "yY" for c in s):
+        return "yellow"
+    if any(c in "Gg" for c in s):
+        return "green"
+    return "red"
+
+
+def read_tls_programs_from_net(net_path: Path) -> dict[str, list[tuple[int, str]]]:
+    """
+    Return {tls_id: [(duration, state), ...]} from the first program of each TLS in the .net.xml.
+    Phase *state* length must match the number of controlled links — inventing GGGG… crashes SUMO.
+    """
+    out: dict[str, list[tuple[int, str]]] = {}
+    if not net_path or not Path(net_path).is_file():
+        return out
+    for _event, elem in ET.iterparse(net_path, events=("end",)):
+        if elem.tag != "tlLogic":
+            continue
+        tid = elem.get("id")
+        if not tid or tid in out:
+            elem.clear()
+            continue
+        phases: list[tuple[int, str]] = []
+        for p in elem.findall("phase"):
+            state = p.get("state") or ""
+            try:
+                dur = int(float(p.get("duration") or "1"))
+            except ValueError:
+                dur = 1
+            if state:
+                phases.append((max(1, dur), state))
+        if phases:
+            out[tid] = phases
+        elem.clear()
+    return out
+
+
 def write_tls_add(
     out_path: Path,
     tls_ids: list[str],
     edits: NetworkEdits,
-    n_phases: int = 2,
+    net_path: Optional[Path] = None,
 ) -> Path:
     """
-    Write tlLogic additional file with configurable G/Y/R timings.
-    Uses a simple 2-phase pattern by default (NS / EW style).
+    Write tlLogic additional file with user G/Y/R timings.
+    Keeps original phase *states* from the network (correct link count); only remaps durations.
+    TLS ids not present in the net are skipped (cannot invent a valid program without link count).
     """
+    programs = read_tls_programs_from_net(net_path) if net_path else {}
     root = ET.Element("additional")
+    written = 0
     for tid in tls_ids:
+        phases = programs.get(tid)
+        if not phases:
+            continue
         timing = edits.tls_overrides.get(tid, edits.tls_default)
         tl = ET.SubElement(
             root,
@@ -104,19 +163,20 @@ def write_tls_add(
             programID="optitraffic",
             offset="0",
         )
-        # Phase A green, yellow, red-clear; Phase B same
-        # State strings are placeholders; SUMO will adapt if length mismatches on load
-        # Prefer letting netconvert TLS remain and only override durations via change
-        state_a = "G" * 8
-        state_y = "y" * 8
-        state_r = "r" * 8
-        ET.SubElement(tl, "phase", duration=str(timing.green), state=state_a)
-        ET.SubElement(tl, "phase", duration=str(timing.yellow), state=state_y)
-        ET.SubElement(tl, "phase", duration=str(timing.red), state=state_r)
-        ET.SubElement(tl, "phase", duration=str(timing.green), state=state_a[::-1].replace("G", "G"))
-        # Second green uses alternate pattern (simplified)
-        ET.SubElement(tl, "phase", duration=str(timing.yellow), state=state_y)
-        ET.SubElement(tl, "phase", duration=str(max(1, timing.red // 4)), state=state_r)
+        for dur, state in phases:
+            kind = _phase_kind(state)
+            if kind == "green":
+                new_dur = max(1, int(timing.green))
+            elif kind == "yellow":
+                new_dur = max(1, int(timing.yellow))
+            else:
+                new_dur = max(1, int(timing.red))
+            ET.SubElement(tl, "phase", duration=str(new_dur), state=state)
+        written += 1
+
+    if written == 0:
+        # Empty additional would be useless; write a harmless comment-only file
+        root.append(ET.Comment("No TLS programs overridden (ids missing in net or empty list)"))
 
     _indent(root)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -219,11 +279,22 @@ def write_all_additionals(
     scenario_dir: Path,
     edits: NetworkEdits,
     tls_ids: list[str],
+    net_path: Optional[Path] = None,
 ) -> list[Path]:
     scenario_dir.mkdir(parents=True, exist_ok=True)
     paths = []
-    if tls_ids:
-        paths.append(write_tls_add(scenario_dir / "tls.add.xml", tls_ids, edits))
+    # Include user-confirmed placements (prefer linked existing TLS id, else edge id)
+    placement_ids = []
+    for p in edits.tls_placements:
+        tid = p.tls_id or f"tls_{p.edge_id}"
+        placement_ids.append(tid)
+        if tid not in edits.tls_overrides:
+            edits.tls_overrides[tid] = edits.tls_default
+    all_tls = list(dict.fromkeys([*tls_ids, *placement_ids, *edits.tls_overrides.keys()]))
+    if all_tls:
+        paths.append(
+            write_tls_add(scenario_dir / "tls.add.xml", all_tls, edits, net_path=net_path)
+        )
     if edits.parking:
         paths.append(write_parking_add(scenario_dir / "parking.add.xml", edits))
     if edits.stops:

@@ -70,6 +70,29 @@ def geocode_city(city: str, country: str) -> Tuple[float, float, str]:
     return float(loc.latitude), float(loc.longitude), str(loc.address)
 
 
+def reverse_geocode(lat: float, lon: float) -> Tuple[str, str, str]:
+    """
+    Return (city, country, display_name) from coordinates.
+    Falls back to empty city/country if Nominatim has no match.
+    """
+    geolocator = Nominatim(user_agent="optitraffic-mvp/0.1")
+    loc = geolocator.reverse((lat, lon), exactly_one=True, timeout=20, language="es")
+    if loc is None:
+        return "", "", f"{lat:.5f}, {lon:.5f}"
+    raw = loc.raw.get("address") or {}
+    city = (
+        raw.get("city")
+        or raw.get("town")
+        or raw.get("village")
+        or raw.get("municipality")
+        or raw.get("county")
+        or raw.get("state_district")
+        or ""
+    )
+    country = raw.get("country") or ""
+    return str(city), str(country), str(loc.address)
+
+
 def rectangle_around(lat: float, lon: float, half_km: float = 0.8) -> Polygon:
     """Axis-aligned rectangle roughly half_km from center."""
     # ~111 km per degree latitude; longitude scaled by cos(lat)

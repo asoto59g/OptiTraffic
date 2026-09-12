@@ -14,7 +14,9 @@ import requests
 from dotenv import load_dotenv
 from shapely.geometry import LineString, shape
 
-DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+_ROOT = Path(__file__).resolve().parents[1]
+_ENV_FILE = _ROOT / ".env"
+DATA_DIR = _ROOT / "data"
 CACHE_DIR = DATA_DIR / "cache" / "tomtom"
 USAGE_FILE = DATA_DIR / "cache" / "tomtom_usage.json"
 
@@ -32,8 +34,9 @@ class TrafficSegment:
 
 
 def load_api_key() -> Optional[str]:
-    load_dotenv()
-    key = os.environ.get("TOMTOM_API_KEY", "").strip()
+    # Always load project .env (Streamlit CWD may differ); override empty shell vars.
+    load_dotenv(_ENV_FILE, override=True)
+    key = os.environ.get("TOMTOM_API_KEY", "").strip().strip('"').strip("'")
     return key or None
 
 

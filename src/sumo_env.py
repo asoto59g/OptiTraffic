@@ -10,6 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
+
+# Load project .env so SUMO_HOME works without a system-wide variable.
+_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(_ROOT / ".env")
+
 
 @dataclass
 class SumoEnv:
@@ -23,7 +29,7 @@ class SumoEnv:
 
 def _candidate_homes() -> list[Path]:
     homes: list[Path] = []
-    env = os.environ.get("SUMO_HOME")
+    env = os.environ.get("SUMO_HOME", "").strip().strip('"')
     if env:
         homes.append(Path(env))
     # Common Windows install locations

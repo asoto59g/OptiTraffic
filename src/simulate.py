@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import csv
 import json
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from .traffic_params import CITY_MAX_SPEED_MS, CONGESTION_SPEED_MS, desired_speed_ms
+from .osm_fetch import SAFE_ROOT, path_is_safe, to_safe_path
 from .sumo_env import SumoEnv, detect_sumo, ensure_sumolib_on_path
+
+SAFE_RUNS = SAFE_ROOT / "runs"
 
 
 @dataclass
@@ -34,8 +39,7 @@ class SimResult:
     tomtom_correlation: Optional[float] = None
 
     def to_dict(self) -> dict[str, Any]:
-        d = asdict(self)
-        return d
+        return asdict(self)
 
 
 def write_sumocfg(
@@ -46,20 +50,31 @@ def write_sumocfg(
     begin: int = 0,
     end: int = 1800,
 ) -> Path:
+    # Native SUMO on Windows fails with non-ASCII paths (OneDrive "Geomática")
+    net_safe = net_path if path_is_safe(net_path) else to_safe_path(net_path)
+    routes_safe = routes_path if path_is_safe(routes_path) else to_safe_path(routes_path)
+    add_safe: list[Path] = []
+    if additional_files:
+        for p in additional_files:
+            add_safe.append(p if path_is_safe(p) else to_safe_path(p))
+
+    if not path_is_safe(cfg_path):
+        SAFE_RUNS.mkdir(parents=True, exist_ok=True)
+        cfg_path = SAFE_RUNS / cfg_path.name
+
     root = ET.Element("configuration")
     inp = ET.SubElement(root, "input")
-    ET.SubElement(inp, "net-file", value=str(net_path).replace("\\", "/"))
-    ET.SubElement(inp, "route-files", value=str(routes_path).replace("\\", "/"))
-    if additional_files:
-        joined = ",".join(str(p).replace("\\", "/") for p in additional_files)
+    ET.SubElement(inp, "net-file", value=str(net_safe).replace("\\", "/"))
+    ET.SubElement(inp, "route-files", value=str(routes_safe).replace("\\", "/"))
+    if add_safe:
+        joined = ",".join(str(p).replace("\\", "/") for p in add_safe)
         ET.SubElement(inp, "additional-files", value=joined)
-    time = ET.SubElement(root, "time")
-    ET.SubElement(time, "begin", value=str(begin))
-    ET.SubElement(time, "end", value=str(end))
+    time_el = ET.SubElement(root, "time")
+    ET.SubElement(time_el, "begin", value=str(begin))
+    ET.SubElement(time_el, "end", value=str(end))
     proc = ET.SubElement(root, "processing")
     ET.SubElement(proc, "time-to-teleport", value="120")
     ET.SubElement(proc, "collision.action", value="warn")
-    # Encourage keep-clear / not blocking junctions
     ET.SubElement(proc, "ignore-junction-blocker", value="0")
 
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
@@ -81,11 +96,65 @@ def _pearson(xs: list[float], ys: list[float]) -> Optional[float]:
     return num / (denx * deny)
 
 
+def _close_traci(label: str = "optitraffic") -> None:
+    """Force-close any active TraCI connection (avoids 'already active')."""
+    try:
+        import traci
+    except ImportError:
+        return
+    for lab in (label, "default"):
+        try:
+            traci.switch(lab)
+            traci.close(wait=False)
+        except Exception:
+            pass
+    try:
+        traci.close(wait=False)
+    except Exception:
+        pass
+    time.sleep(0.3)
+
+
+def _sumo_stderr_probe(sumo_bin: Path, cfg_path: Path) -> str:
+    """Run SUMO briefly without TraCI to capture the real load error."""
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            [
+                str(sumo_bin),
+                "-c",
+                str(cfg_path),
+                "--begin",
+                "0",
+                "--end",
+                "1",
+                "--no-step-log",
+                "true",
+                "--no-warnings",
+                "true",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception as e:
+        return str(e)
+    err = (r.stderr or "").strip()
+    out = (r.stdout or "").strip()
+    msg = err or out
+    if not msg:
+        msg = f"SUMO exit code {r.returncode}"
+    # Keep message short for UI
+    lines = [ln.strip() for ln in msg.splitlines() if ln.strip()]
+    return " | ".join(lines[:6])
+
+
 def run_simulation(
     cfg_path: Path,
     sumo: Optional[SumoEnv] = None,
     step_length: float = 1.0,
-    speed_cong_threshold: float = 3.0,
+    speed_cong_threshold: float = CONGESTION_SPEED_MS,
     edge_levels: Optional[dict[str, float]] = None,
 ) -> SimResult:
     sumo = sumo or detect_sumo()
@@ -94,39 +163,102 @@ def run_simulation(
     ensure_sumolib_on_path(sumo.home)
     import traci
 
-    cmd = [str(sumo.sumo_bin), "-c", str(cfg_path), "--start", "--quit-on-end", "true"]
-    traci.start(cmd)
+    label = "optitraffic"
+    _close_traci(label)
+
+    cfg_safe = cfg_path if path_is_safe(cfg_path) else to_safe_path(cfg_path)
+    cmd = [
+        str(sumo.sumo_bin),
+        "-c",
+        str(cfg_safe),
+        "--start",
+        "--quit-on-end",
+        "true",
+        "--no-warnings",
+        "true",
+        "--default.speeddev",
+        "0.1",
+    ]
+
+    try:
+        traci.start(cmd, label=label)
+    except Exception as e1:
+        _close_traci(label)
+        time.sleep(0.5)
+        try:
+            traci.start(cmd, label=label)
+        except Exception as e2:
+            detail = _sumo_stderr_probe(sumo.sumo_bin, cfg_safe)
+            raise RuntimeError(
+                f"No se pudo iniciar SUMO/TraCI: {e2}. Detalle SUMO: {detail}"
+            ) from e2
+
+    traci.switch(label)
+
+    # Peak-hour: reduce edge allowed speed from TomTom relative speed (level 1 = free).
+    if edge_levels:
+        for eid, level in edge_levels.items():
+            try:
+                traci.edge.setMaxSpeed(eid, desired_speed_ms(level, CITY_MAX_SPEED_MS))
+            except traci.TraCIException:
+                continue
+    else:
+        # Still enforce municipal cap on all known edges
+        try:
+            for eid in traci.edge.getIDList():
+                if eid.startswith(":"):
+                    continue
+                try:
+                    cur = traci.edge.getMaxSpeed(eid)
+                    if cur > CITY_MAX_SPEED_MS:
+                        traci.edge.setMaxSpeed(eid, CITY_MAX_SPEED_MS)
+                except traci.TraCIException:
+                    continue
+        except traci.TraCIException:
+            pass
 
     edge_acc: dict[str, dict[str, float]] = {}
     vehicle_steps = 0
     total_waiting = 0.0
     speed_samples = 0.0
     speed_sum = 0.0
-    end = int(traci.simulation.getEndTime()) if hasattr(traci.simulation, "getEndTime") else 1800
 
     try:
-        while traci.simulation.getMinExpectedNumber() > 0 or traci.simulation.getTime() < end:
+        end = float(traci.simulation.getEndTime())
+    except Exception:
+        end = 1800.0
+    if end <= 0 or end > 1e7:
+        end = 1800.0
+
+    try:
+        while True:
             traci.simulationStep()
-            t = traci.simulation.getTime()
-            if t > end:
+            t = float(traci.simulation.getTime())
+            if t >= end:
                 break
+
             veh_ids = traci.vehicle.getIDList()
             vehicle_steps += len(veh_ids)
             for vid in veh_ids:
-                total_waiting += traci.vehicle.getWaitingTime(vid)
-                speed_sum += traci.vehicle.getSpeed(vid)
-                speed_samples += 1
-                eid = traci.vehicle.getRoadID(vid)
-                if eid.startswith(":"):
+                try:
+                    total_waiting += traci.vehicle.getWaitingTime(vid)
+                    speed_sum += traci.vehicle.getSpeed(vid)
+                    speed_samples += 1
+                    eid = traci.vehicle.getRoadID(vid)
+                except traci.TraCIException:
+                    continue
+                if not eid or eid.startswith(":"):
                     continue
                 acc = edge_acc.setdefault(
                     eid, {"speed": 0.0, "occ": 0.0, "wait": 0.0, "n": 0.0, "max_occ": 0.0}
                 )
-                acc["speed"] += traci.vehicle.getSpeed(vid)
-                acc["wait"] += traci.vehicle.getWaitingTime(vid)
+                try:
+                    acc["speed"] += traci.vehicle.getSpeed(vid)
+                    acc["wait"] += traci.vehicle.getWaitingTime(vid)
+                except traci.TraCIException:
+                    pass
                 acc["n"] += 1
 
-            # Sample occupancy every 10s
             if int(t) % 10 == 0:
                 for eid in list(edge_acc.keys()):
                     try:
@@ -136,7 +268,11 @@ def run_simulation(
                     edge_acc[eid]["occ"] += occ
                     edge_acc[eid]["max_occ"] = max(edge_acc[eid]["max_occ"], occ)
     finally:
-        traci.close()
+        try:
+            traci.close(wait=False)
+        except Exception:
+            pass
+        _close_traci(label)
 
     edges: dict[str, EdgeKPI] = {}
     congested = 0
@@ -162,9 +298,8 @@ def run_simulation(
         xs, ys = [], []
         for eid, level in edge_levels.items():
             if eid in edges:
-                # Compare congestion: (1 - tomtom_level) vs (low speed)
                 xs.append(1.0 - float(level))
-                ys.append(max(0.0, 1.0 - edges[eid].mean_speed / 13.9))
+                ys.append(max(0.0, 1.0 - edges[eid].mean_speed / CITY_MAX_SPEED_MS))
         corr = _pearson(xs, ys)
 
     mean_speed = (speed_sum / speed_samples) if speed_samples else 0.0

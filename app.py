@@ -19,25 +19,47 @@ from src.area import (  # noqa: E402
     load_geojson_polygon,
     polygon_from_bounds,
     rectangle_around,
+    reverse_geocode,
     validate_area,
 )
-from src.demand import generate_demand  # noqa: E402
+from src.demand import DENSITY_SCENARIOS, generate_demand, get_density_scenario  # noqa: E402
 from src.editors import (  # noqa: E402
     LaneOverride,
     NetworkEdits,
     ParkingConfig,
     StopSign,
+    TlsPlacement,
     TlsTiming,
     write_all_additionals,
 )
-from src.network_build import build_network, edges_geojson, list_traffic_lights, save_edges_geojson  # noqa: E402
-from src.osm_fetch import prepare_clipped_osm  # noqa: E402
-from src.scenarios import list_scenarios, load_scenario, save_scenario  # noqa: E402
+from src.network_build import (  # noqa: E402
+    annotate_edge_directions,
+    build_network,
+    cap_network_speeds,
+    edges_geojson,
+    list_traffic_lights,
+    save_edges_geojson,
+)
+from src.osm_fetch import (  # noqa: E402
+    geofabrik_url,
+    listed_countries,
+    prepare_clipped_osm,
+    resolve_geofabrik_path,
+)
+from src.scenarios import (  # noqa: E402
+    apply_scenario_to_session,
+    list_scenarios,
+    load_scenario,
+    save_scenario,
+    scenarios_matching_area,
+)
 from src.simulate import (  # noqa: E402
+    SAFE_RUNS,
     export_edge_csv,
     export_edge_geojson,
     run_simulation,
     write_sumocfg,
+    _close_traci,
 )
 from src.sumo_env import detect_sumo  # noqa: E402
 from src.tomtom import (  # noqa: E402
@@ -48,13 +70,26 @@ from src.tomtom import (  # noqa: E402
     segments_to_geojson,
     usage_count,
 )
+from src.traffic_params import CITY_MAX_SPEED_KMH, CITY_MAX_SPEED_MS, VEH_LENGTH_M  # noqa: E402
 from src.viz import (  # noqa: E402
     add_draw_control,
     add_edges_layer,
+    add_junction_markers,
     add_polygon,
     add_tls_markers,
     base_map,
+    build_junctions,
+    click_latlon,
+    edge_center_latlon,
     extract_drawn_geojson,
+    fit_edge,
+    fit_junction,
+    fit_polygon,
+    map_key,
+    nearest_edge_id,
+    nearest_junction,
+    nearest_tls,
+    simplify_edges_for_map,
 )
 
 st.set_page_config(
@@ -74,9 +109,35 @@ STEPS = [
 ]
 
 
+def go_to(step: str) -> None:
+    """Navigate wizard. Sync sidebar radio on next run (never after widget exists)."""
+    if step not in STEPS:
+        return
+    st.session_state.step = step
+    st.session_state._pending_nav = step
+    st.rerun()
+
+
+def apply_pending_nav() -> None:
+    """Must run BEFORE sidebar radio(key='nav_step') is created."""
+    pending = st.session_state.pop("_pending_nav", None)
+    if pending in STEPS:
+        st.session_state.step = pending
+        st.session_state.nav_step = pending
+
+
+def apply_pending_place() -> None:
+    """Apply deferred city/country before text_input widgets exist."""
+    if "_pending_city" in st.session_state:
+        st.session_state.city = st.session_state.pop("_pending_city")
+    if "_pending_country" in st.session_state:
+        st.session_state.country = st.session_state.pop("_pending_country")
+
+
 def init_state() -> None:
     defaults = {
         "step": STEPS[0],
+        "nav_step": STEPS[0],
         "area": None,
         "net_path": None,
         "edges_gj": None,
@@ -86,12 +147,19 @@ def init_state() -> None:
         "sim_result": None,
         "run_dir": None,
         "center": (9.93, -84.08),
+        "map_zoom": 14,
+        "map_nonce": 0,
+        "preview_polygon": None,
         "city": "San José",
         "country": "Costa Rica",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+    apply_pending_nav()
+    apply_pending_place()
+    if st.session_state.get("nav_step") not in STEPS:
+        st.session_state.nav_step = st.session_state.step
 
 
 def sidebar() -> None:
@@ -115,31 +183,44 @@ def sidebar() -> None:
     else:
         st.sidebar.warning("Sin TOMTOM_API_KEY (.env)")
 
-    st.session_state.step = st.sidebar.radio("Pasos", STEPS, index=STEPS.index(st.session_state.step))
+    # nav_step already synced via apply_pending_nav() before this widget
+    st.sidebar.radio("Pasos", STEPS, key="nav_step")
+    if st.session_state.nav_step != st.session_state.step:
+        st.session_state.step = st.session_state.nav_step
 
     st.sidebar.divider()
-    st.sidebar.subheader("Escenarios")
+    st.sidebar.subheader("Escenarios guardados")
     scenarios = list_scenarios()
     if scenarios:
         labels = [p.name for p in scenarios]
-        pick = st.sidebar.selectbox("Cargar", ["—"] + labels)
-        if pick != "—" and st.sidebar.button("Abrir escenario"):
+        pick = st.sidebar.selectbox("Cargar configuración", ["—"] + labels, key="sidebar_scen_pick")
+        if pick != "—" and st.sidebar.button("Abrir escenario", key="sidebar_scen_open"):
             data = load_scenario(next(p for p in scenarios if p.name == pick))
-            st.session_state.area = data["area"]
-            st.session_state.edits = data["edits"]
-            st.session_state.edge_levels = data["edge_levels"]
-            st.session_state.city = data["area"].city
-            st.session_state.country = data["area"].country
-            st.session_state.center = data["area"].center
-            net = data["meta"].get("net_path")
-            if net and Path(net).exists():
-                st.session_state.net_path = Path(net)
-                try:
-                    st.session_state.edges_gj = edges_geojson(Path(net))
-                except Exception:
-                    pass
-            st.sidebar.success("Escenario cargado")
-            st.rerun()
+            hint = apply_scenario_to_session(data, st.session_state)
+            st.sidebar.success(f"Cargado: {data['meta'].get('name', pick)}")
+            if hint == "config":
+                go_to(STEPS[2])
+            elif hint == "red":
+                go_to(STEPS[1])
+            else:
+                go_to(STEPS[0])
+    else:
+        st.sidebar.caption("Aún no hay escenarios. Guarde desde Configuración o Resultados.")
+
+
+def _bump_map(center: tuple[float, float] | None = None, zoom: int | None = None) -> None:
+    """Force Folium remount after city / polygon changes."""
+    if center is not None:
+        st.session_state.center = center
+    if zoom is not None:
+        st.session_state.map_zoom = zoom
+    st.session_state.map_nonce = int(st.session_state.get("map_nonce", 0)) + 1
+
+
+def _guess_place_from_filename(name: str) -> str:
+    stem = Path(name).stem
+    stem = stem.replace("_", " ").replace("-", " ").strip()
+    return stem
 
 
 def step_zona() -> None:
@@ -151,17 +232,17 @@ def step_zona() -> None:
 
     c1, c2, c3 = st.columns([2, 2, 1])
     with c1:
-        city = st.text_input("Ciudad", value=st.session_state.city)
+        city = st.text_input("Ciudad", key="city")
     with c2:
-        country = st.text_input("País", value=st.session_state.country)
+        country = st.text_input("País", key="country")
     with c3:
         if st.button("Geocodificar", use_container_width=True):
             try:
                 lat, lon, addr = geocode_city(city, country)
-                st.session_state.center = (lat, lon)
-                st.session_state.city = city
-                st.session_state.country = country
+                st.session_state.preview_polygon = None
+                _bump_map(center=(lat, lon), zoom=14)
                 st.success(addr)
+                st.rerun()
             except Exception as e:
                 st.error(str(e))
 
@@ -169,6 +250,7 @@ def step_zona() -> None:
         "Método de delimitación",
         ["Rectángulo alrededor del centro", "Bounds manuales", "Dibujo en mapa", "Subir GeoJSON"],
         horizontal=True,
+        key="zona_mode",
     )
 
     polygon = None
@@ -189,12 +271,17 @@ def step_zona() -> None:
             st.error(str(e))
     elif mode == "Dibujo en mapa":
         st.info("Dibuje un polígono o rectángulo con las herramientas del mapa (arriba izquierda).")
-        m = base_map(st.session_state.center)
+        m = base_map(st.session_state.center, zoom=int(st.session_state.get("map_zoom", 14)))
         add_draw_control(m)
         try:
             from streamlit_folium import st_folium
 
-            out = st_folium(m, width=None, height=480, key="draw_map")
+            out = st_folium(
+                m,
+                width=None,
+                height=480,
+                key=map_key("draw", st.session_state.center, st.session_state.map_nonce),
+            )
             drawn = extract_drawn_geojson(out)
             if drawn:
                 try:
@@ -206,11 +293,36 @@ def step_zona() -> None:
             st.error("Instale streamlit-folium")
     else:
         up = st.file_uploader("GeoJSON (Polygon)", type=["geojson", "json"])
-        if up:
+        if up is not None:
+            file_id = f"{up.name}_{up.size}"
             try:
-                polygon = load_geojson_polygon(up.read())
+                polygon = load_geojson_polygon(up.getvalue())
+                minx, miny, maxx, maxy = polygon.bounds
+                center = ((miny + maxy) / 2, (minx + maxx) / 2)
+                if st.session_state.get("geojson_file_id") != file_id:
+                    st.session_state.geojson_file_id = file_id
+                    st.session_state.preview_polygon = polygon
+                    _bump_map(center=center, zoom=15)
+                    # Defer city/country update (cannot set after text_input widgets)
+                    try:
+                        rcity, rcountry, addr = reverse_geocode(center[0], center[1])
+                        st.session_state._pending_city = rcity or _guess_place_from_filename(up.name)
+                        if rcountry:
+                            st.session_state._pending_country = rcountry
+                        st.session_state.last_reverse_addr = addr
+                    except Exception:
+                        guess = _guess_place_from_filename(up.name)
+                        if guess:
+                            st.session_state._pending_city = guess
+                    st.rerun()
+                else:
+                    st.session_state.preview_polygon = polygon
+                    st.session_state.center = center
+                if st.session_state.get("last_reverse_addr"):
+                    st.caption(f"Ubicación detectada: {st.session_state.last_reverse_addr}")
             except Exception as e:
                 st.error(str(e))
+                polygon = st.session_state.get("preview_polygon")
 
     if polygon is not None:
         ok, msg = validate_area(polygon)
@@ -219,27 +331,136 @@ def step_zona() -> None:
         else:
             st.error(msg)
 
-        m2 = base_map(st.session_state.center)
-        add_polygon(m2, polygon)
+        minx, miny, maxx, maxy = polygon.bounds
+        poly_center = ((miny + maxy) / 2, (minx + maxx) / 2)
+        m2 = base_map(poly_center, zoom=int(st.session_state.get("map_zoom", 14)))
+        add_polygon(m2, polygon, fit=True)
+        fit_polygon(m2, polygon)
         try:
             from streamlit_folium import st_folium
 
-            st_folium(m2, width=None, height=360, key="preview_area")
+            st_folium(
+                m2,
+                width=None,
+                height=360,
+                key=map_key(
+                    "preview",
+                    poly_center,
+                    round(minx, 5),
+                    round(miny, 5),
+                    round(maxx, 5),
+                    round(maxy, 5),
+                    st.session_state.map_nonce,
+                ),
+            )
         except ImportError:
             st.write(polygon.bounds)
 
+        st.write(f"Ciudad/país actuales: **{st.session_state.city}**, **{st.session_state.country}**")
+
         if ok and st.button("Confirmar zona", type="primary"):
             try:
-                area = build_study_area(city, country, polygon)
+                area = build_study_area(
+                    st.session_state.city,
+                    st.session_state.country,
+                    polygon,
+                )
                 st.session_state.area = area
-                st.session_state.city = city
-                st.session_state.country = country
                 st.session_state.center = area.center
-                st.session_state.step = STEPS[1]
+                st.session_state.preview_polygon = polygon
+                # Clear previous network so Liberia doesn't keep San José edges
+                st.session_state.net_path = None
+                st.session_state.edges_gj = None
+                st.session_state.tls_list = []
+                st.session_state.edge_levels = {}
+                st.session_state.sim_result = None
                 st.success(f"Zona lista: {area.label} ({area.area_km2:.2f} km²)")
-                st.rerun()
+                go_to(STEPS[1])
             except Exception as e:
                 st.error(str(e))
+    elif mode != "Dibujo en mapa":
+        m0 = base_map(st.session_state.center, zoom=int(st.session_state.get("map_zoom", 14)))
+        try:
+            from streamlit_folium import st_folium
+
+            st_folium(
+                m0,
+                width=None,
+                height=360,
+                key=map_key("city", st.session_state.center, st.session_state.map_nonce),
+            )
+        except ImportError:
+            pass
+
+def render_study_map(
+    *,
+    title: str,
+    mode: str = "plain",
+    value_by_id: dict | None = None,
+    show_tls: bool = False,
+    show_area: bool = True,
+    show_direction: bool = False,
+    height: int = 480,
+    key_prefix: str = "study",
+) -> None:
+    """Always-visible Folium map for the current study area / network."""
+    area = st.session_state.area
+    edges_gj = st.session_state.edges_gj
+    if area is None:
+        return
+
+    if edges_gj and (edges_gj.get("features") or []) and "oneway" not in (
+        (edges_gj["features"][0].get("properties") or {})
+    ):
+        edges_gj = annotate_edge_directions(edges_gj)
+        st.session_state.edges_gj = edges_gj
+
+    st.subheader(title)
+    m = base_map(area.center, zoom=int(st.session_state.get("map_zoom", 14)))
+    if edges_gj:
+        add_edges_layer(
+            m,
+            edges_gj,
+            value_by_id=value_by_id,
+            mode=mode,
+            name="Red / tráfico",
+            fit=True,
+            show_direction=show_direction and mode == "plain",
+        )
+        stats = edges_gj.get("_direction_stats") or {}
+        if stats:
+            st.caption(
+                f"Sentidos OSM/SUMO: **{stats.get('oneway_edges', 0)}** un sentido · "
+                f"**{stats.get('twoway_edges', 0)}** doble sentido "
+                f"({stats.get('oneway_pct', 0)}% único). "
+                "Los vehículos solo circulan en el sentido del edge (flechas)."
+            )
+    if show_area:
+        add_polygon(m, area.polygon, fit=not bool(edges_gj))
+    if show_tls:
+        add_tls_markers(m, st.session_state.tls_list or [])
+
+    n_edges = len((edges_gj or {}).get("features", []))
+    n_vals = len(value_by_id or {})
+    try:
+        from streamlit_folium import st_folium
+
+        st_folium(
+            m,
+            width=None,
+            height=height,
+            key=map_key(
+                key_prefix,
+                mode,
+                area.center,
+                n_edges,
+                n_vals,
+                show_direction,
+                st.session_state.get("map_nonce", 0),
+            ),
+        )
+    except ImportError:
+        st.info("Instale streamlit-folium para ver el mapa.")
 
 
 def step_red() -> None:
@@ -253,190 +474,573 @@ def step_red() -> None:
         f"**{area.label}** · {area.area_km2:.2f} km² · "
         f"bbox `{tuple(round(x, 5) for x in area.bbox)}`"
     )
-    force = st.checkbox("Forzar re-descarga Geofabrik", value=False)
+
+    # Mapa siempre visible (zona y/o red ya generada)
+    render_study_map(
+        title="Mapa de la zona / red",
+        mode="plain",
+        show_tls=True,
+        show_direction=True,
+        key_prefix="net",
+    )
+
+    st.info(
+        "La red respeta **oneway** de OpenStreetMap: si OSM marca un solo sentido, "
+        "SUMO solo crea ese edge dirigido. Si OSM no trae `oneway=yes`, la calle queda "
+        "de doble sentido (dos edges). Regenerar la red aplica atributos OSM completos."
+    )
+
+    force = st.checkbox("Forzar re-descarga (ignorar caché local)", value=False)
+    osm_source = st.radio(
+        "Fuente OSM",
+        options=["auto", "overpass", "geofabrik"],
+        format_func=lambda k: {
+            "auto": "Auto (Overpass → Geofabrik)",
+            "overpass": "Solo Overpass (rápido, zona pequeña)",
+            "geofabrik": "Solo Geofabrik (extracto país completo)",
+        }[k],
+        horizontal=True,
+        key="osm_source",
+    )
+    try:
+        gf_path = resolve_geofabrik_path(area.country)
+        gf_url = geofabrik_url(area.country)
+        st.caption(f"Geofabrik para **{area.country}**: `{gf_path}` → {gf_url}")
+    except Exception as e:
+        st.warning(str(e))
+        st.caption("Países con extracto mapeado: " + ", ".join(listed_countries()[:20]) + "…")
 
     sumo = detect_sumo()
     if st.button("Descargar OSM, recortar y generar red SUMO", type="primary"):
         if not sumo.ok:
             st.error(sumo.message)
             return
-        with st.spinner("Descargando extracto Geofabrik (puede tardar)…"):
-            try:
-                extract, clipped = prepare_clipped_osm(area, force_download=force)
-                st.write(f"Extracto: `{extract.name}`")
-                st.write(f"Recorte: `{clipped}`")
-            except Exception as e:
-                st.error(f"OSM: {e}")
-                return
-        with st.spinner("Ejecutando netconvert…"):
-            try:
+        status = st.empty()
+        status.info("Obteniendo OSM y generando red… el mapa de arriba permanece visible.")
+        try:
+            with st.spinner("Descargando / recortando OSM…"):
+                extract, clipped = prepare_clipped_osm(
+                    area,
+                    force_download=force,
+                    source=osm_source,
+                )
+            status.write(f"Extracto: `{extract.name}` · Recorte: `{clipped}`")
+            with st.spinner("Ejecutando netconvert…"):
                 net = build_network(clipped, area, sumo=sumo)
                 st.session_state.net_path = net
                 gj = edges_geojson(net, sumo=sumo)
                 st.session_state.edges_gj = gj
                 save_edges_geojson(net)
+                stats = gj.get("_direction_stats") or {}
                 try:
                     st.session_state.tls_list = list_traffic_lights(net, sumo=sumo)
                 except Exception:
                     st.session_state.tls_list = []
-                st.success(f"Red generada: {net} ({len(gj.get('features', []))} edges)")
-            except Exception as e:
-                st.error(str(e))
-                return
-
-    if st.session_state.edges_gj:
-        m = base_map(area.center)
-        add_edges_layer(m, st.session_state.edges_gj, name="Edges SUMO")
-        add_polygon(m, area.polygon)
-        add_tls_markers(m, st.session_state.tls_list or [])
-        try:
-            from streamlit_folium import st_folium
-
-            st_folium(m, width=None, height=480, key="net_map")
-        except ImportError:
-            st.json({"n_edges": len(st.session_state.edges_gj["features"])})
-
-        if st.button("Continuar a configuración"):
-            st.session_state.step = STEPS[2]
+                _bump_map()
+            st.success(
+                f"Red generada: {net} ({len(gj.get('features', []))} edges) · "
+                f"sentido único={stats.get('oneway_edges', '?')} · "
+                f"doble={stats.get('twoway_edges', '?')}"
+            )
             st.rerun()
+        except Exception as e:
+            st.error(f"OSM/red: {e}")
+            return
+
+    if st.session_state.edges_gj and st.button("Continuar a configuración"):
+        go_to(STEPS[2])
 
 
 def step_config() -> None:
     st.header("3. Configuración vial")
+    st.info(
+        "Para **semáforos**: clic en el **punto gris del cruce** (intersección). "
+        "Para parqueo/alto/carriles: clic en la **línea** de la calle. "
+        "Luego pulse **Confirmar** debajo del mapa."
+    )
     edits: NetworkEdits = st.session_state.edits
+    for k, v in {
+        "selected_edge_id": None,
+        "selected_edge_name": "",
+        "selected_tls_id": None,
+        "selected_junction_id": None,
+        "selected_junction": None,
+    }.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-    st.subheader("Semáforos (default)")
+    area = st.session_state.area
+    edges_gj = st.session_state.edges_gj
+    if area is None or not edges_gj:
+        st.warning("Genere primero la red en el paso 2.")
+        if st.button("Ir a Red OSM/SUMO"):
+            go_to(STEPS[1])
+        return
+
+    if edges_gj and "oneway" not in ((edges_gj.get("features") or [{}])[0].get("properties") or {}):
+        edges_gj = annotate_edge_directions(edges_gj)
+        st.session_state.edges_gj = edges_gj
+        st.session_state._junctions_key = None  # refresh slim map cache
+
+    junctions_key = (
+        f"junc_{len(edges_gj.get('features', []))}_{st.session_state.get('map_nonce', 0)}"
+    )
+    if st.session_state.get("_junctions_key") != junctions_key:
+        st.session_state._junctions_key = junctions_key
+        st.session_state._junctions_cache = build_junctions(edges_gj)
+        st.session_state._edges_map_slim = simplify_edges_for_map(edges_gj, max_points=6)
+    junctions = st.session_state._junctions_cache
+    edges_map = st.session_state.get("_edges_map_slim") or edges_gj
+
+    color_by_id: dict[str, str] = {}
+    weight_by_id: dict[str, int] = {}
+    for p in edits.parking:
+        color_by_id[p.edge_id] = "#27ae60"
+        weight_by_id[p.edge_id] = 5
+    for s in edits.stops:
+        color_by_id[s.edge_id] = "#e67e22"
+        weight_by_id[s.edge_id] = 5
+    for lo in edits.lane_overrides:
+        if lo.edge_id not in color_by_id:
+            color_by_id[lo.edge_id] = "#9b59b6"
+            weight_by_id[lo.edge_id] = 5
+    for p in edits.tls_placements:
+        color_by_id[p.edge_id] = "#f1c40f"
+        weight_by_id[p.edge_id] = 6
+        if p.junction_id:
+            for j in junctions:
+                if j["id"] == p.junction_id:
+                    for e2 in j.get("edges") or []:
+                        color_by_id[e2] = "#f1c40f"
+                        weight_by_id[e2] = 6
+
+    sel = st.session_state.selected_edge_id
+    sel_j = st.session_state.selected_junction_id
+    if sel_j:
+        for j in junctions:
+            if j["id"] == sel_j:
+                for e2 in j.get("edges") or []:
+                    color_by_id[e2] = "#e74c3c"
+                    weight_by_id[e2] = 7
+    elif sel:
+        color_by_id[sel] = "#e74c3c"
+        weight_by_id[sel] = 7
+
+    st.subheader("Mapa interactivo")
+    st.caption(
+        "La lentitud al confirmar no depende de Geofabrik: el mapa Folium se reconstruye en local. "
+        "Se usa una versión simplificada de la red para acelerar."
+    )
+    zoom_cfg = st.slider(
+        "Zoom del mapa de configuración",
+        min_value=15,
+        max_value=19,
+        value=int(st.session_state.get("config_zoom", 17)),
+        help="Suba el zoom si cuesta hacer clic en el cruce",
+    )
+    st.session_state.config_zoom = zoom_cfg
+
+    cleg1, cleg2, cleg3, cleg4, cleg5, cleg6 = st.columns(6)
+    cleg1.markdown("⚫ Cruce")
+    cleg2.markdown("🔴 Seleccionado")
+    cleg3.markdown("🟡 Semáforo OK")
+    cleg4.markdown("🟢 Parqueo")
+    cleg5.markdown("🟠 Alto")
+    cleg6.markdown("▲ Sentido OSM")
+
+    map_center = area.center
+    if sel_j and st.session_state.selected_junction:
+        map_center = (
+            float(st.session_state.selected_junction["lat"]),
+            float(st.session_state.selected_junction["lon"]),
+        )
+    elif sel:
+        mid = edge_center_latlon(edges_gj, sel)
+        if mid:
+            map_center = mid
+
+    m = base_map(map_center, zoom=zoom_cfg)
+    add_edges_layer(
+        m,
+        edges_map,
+        mode="plain",
+        fit=False,
+        color_by_id=color_by_id,
+        weight_by_id=weight_by_id,
+        weight=3,
+        show_direction=True,
+        direction_max_arrows=180,
+    )
+    add_junction_markers(m, junctions, selected_id=sel_j, min_degree=2)
+    add_tls_markers(m, st.session_state.tls_list or [], selected_id=st.session_state.selected_tls_id)
+    if sel_j and st.session_state.selected_junction:
+        fit_junction(m, st.session_state.selected_junction, pad=0.0006)
+    elif sel:
+        fit_edge(m, edges_gj, sel, pad=0.00045)
+
+    # Remount only when selection/zoom/style changes — not on every widget tick.
+    style_sig = (
+        len(edits.parking),
+        len(edits.stops),
+        len(edits.lane_overrides),
+        len(edits.tls_placements),
+    )
+    try:
+        from streamlit_folium import st_folium
+
+        map_out = st_folium(
+            m,
+            width=None,
+            height=480,
+            returned_objects=["last_object_clicked", "last_clicked"],
+            key=map_key(
+                "cfg_click_v2",
+                area.center,
+                sel,
+                sel_j,
+                zoom_cfg,
+                style_sig,
+            ),
+        )
+    except ImportError:
+        map_out = None
+        st.error("Instale streamlit-folium")
+
+    clicked = click_latlon(map_out)
+    if clicked:
+        clat, clon = clicked
+        changed = False
+        j_hit = nearest_junction(junctions, clat, clon, max_dist_deg=0.0012, min_degree=2)
+        if j_hit:
+            if st.session_state.selected_junction_id != j_hit["id"]:
+                st.session_state.selected_junction_id = j_hit["id"]
+                st.session_state.selected_junction = j_hit
+                edges_at = j_hit.get("edges") or []
+                if edges_at:
+                    st.session_state.selected_edge_id = edges_at[0]
+                    st.session_state.selected_edge_name = ""
+                    for feat in edges_gj.get("features", []):
+                        if feat.get("properties", {}).get("id") == edges_at[0]:
+                            st.session_state.selected_edge_name = feat["properties"].get("name") or ""
+                            break
+                changed = True
+            near_tls = nearest_tls(st.session_state.tls_list or [], clat, clon, max_dist_deg=0.0010)
+            if near_tls and st.session_state.selected_tls_id != near_tls["id"]:
+                st.session_state.selected_tls_id = near_tls["id"]
+                changed = True
+        else:
+            edge_hit = nearest_edge_id(edges_map, clat, clon)
+            if edge_hit:
+                eid = edge_hit.get("id")
+                if eid and (
+                    eid != st.session_state.selected_edge_id
+                    or st.session_state.selected_junction_id is not None
+                ):
+                    st.session_state.selected_edge_id = eid
+                    st.session_state.selected_edge_name = edge_hit.get("name") or ""
+                    st.session_state.selected_junction_id = None
+                    st.session_state.selected_junction = None
+                    changed = True
+        if changed:
+            st.rerun()
+
+    eid = st.session_state.selected_edge_id
+    ename = st.session_state.selected_edge_name or "(sin nombre)"
+    jid = st.session_state.selected_junction_id
+    st.subheader("1) Confirmar selección")
+    if not eid and not jid and not st.session_state.selected_tls_id:
+        st.warning(
+            "Haga clic en un **punto gris del cruce** para semáforo, o en una **calle** para parqueo/alto."
+        )
+    else:
+        if jid:
+            deg = (st.session_state.selected_junction or {}).get("degree", "?")
+            st.success(f"Intersección seleccionada: `{jid}` ({deg} tramos) — lista para semáforo")
+        elif eid:
+            st.success(f"Calle seleccionada: **{ename}** · `{eid}`")
+        if st.session_state.selected_tls_id:
+            st.info(f"Semáforo OSM detectado cerca: `{st.session_state.selected_tls_id}`")
+
+        st.markdown("**¿Qué desea confirmar en este punto?**")
+        a1, a2, a3, a4 = st.columns(4)
+        with a1:
+            can_tls = bool(jid or eid)
+            if st.button(
+                "✅ Confirmar semáforo aquí",
+                type="primary",
+                use_container_width=True,
+                disabled=not can_tls,
+            ):
+                linked = st.session_state.selected_tls_id
+                edge_for_place = eid or ((st.session_state.selected_junction or {}).get("edges") or [""])[0]
+                tid = linked or (f"tls_j_{jid}" if jid else f"tls_{edge_for_place}")
+                edits.tls_placements = [
+                    t
+                    for t in edits.tls_placements
+                    if t.edge_id != edge_for_place and t.junction_id != jid
+                ]
+                edits.tls_placements.append(
+                    TlsPlacement(
+                        edge_id=edge_for_place,
+                        tls_id=tid,
+                        junction_id=jid,
+                        name=f"Cruce {jid}" if jid else ename,
+                    )
+                )
+                edits.tls_overrides[tid] = edits.tls_default
+                st.session_state.edits = edits
+                st.success("Semáforo confirmado en la intersección.")
+                st.rerun()
+        with a2:
+            if st.button("✅ Confirmar alto", use_container_width=True, disabled=not eid):
+                if not any(s.edge_id == eid for s in edits.stops):
+                    edits.stops.append(StopSign(edge_id=eid, junction_id=jid))
+                st.session_state.edits = edits
+                st.rerun()
+        with a3:
+            if st.button("✅ Confirmar parqueo", use_container_width=True, disabled=not eid):
+                edits.parking = [p for p in edits.parking if p.edge_id != eid]
+                edits.parking.append(
+                    ParkingConfig(
+                        edge_id=eid,
+                        side="right",
+                        corner_clearance_m=5.0,
+                        length_m=40.0,
+                        capacity=8,
+                    )
+                )
+                st.session_state.edits = edits
+                st.rerun()
+        with a4:
+            if st.button("🗑️ Quitar selección", use_container_width=True, disabled=not (eid or jid)):
+                if eid:
+                    edits.lane_overrides = [x for x in edits.lane_overrides if x.edge_id != eid]
+                    edits.parking = [p for p in edits.parking if p.edge_id != eid]
+                    edits.stops = [s for s in edits.stops if s.edge_id != eid]
+                edits.tls_placements = [
+                    t
+                    for t in edits.tls_placements
+                    if t.edge_id != eid and (not jid or t.junction_id != jid)
+                ]
+                st.session_state.edits = edits
+                st.rerun()
+
+    st.subheader("2) Tiempos de semáforo")
     g, y, r = st.columns(3)
     green = g.number_input("Verde (s)", 5, 180, edits.tls_default.green)
     yellow = y.number_input("Amarillo (s)", 1, 15, edits.tls_default.yellow)
     red = r.number_input("Rojo (s)", 5, 180, edits.tls_default.red)
     edits.tls_default = TlsTiming(green=int(green), yellow=int(yellow), red=int(red))
 
-    tls_ids = [t["id"] for t in (st.session_state.tls_list or [])]
-    st.caption(f"Semáforos detectados en red: {len(tls_ids)}")
-    if tls_ids:
-        sel = st.multiselect("Aplicar override a TLS", tls_ids)
-        if sel:
-            og, oy, or_ = st.columns(3)
-            ogv = og.number_input("Override verde", 5, 180, green, key="og")
-            oyv = oy.number_input("Override amarillo", 1, 15, yellow, key="oy")
-            orv = or_.number_input("Override rojo", 5, 180, red, key="or")
-            for tid in sel:
-                edits.tls_overrides[tid] = TlsTiming(int(ogv), int(oyv), int(orv))
+    target_tls = st.session_state.selected_tls_id
+    if not target_tls and (eid or jid):
+        for p in edits.tls_placements:
+            if (jid and p.junction_id == jid) or (eid and p.edge_id == eid):
+                target_tls = p.tls_id or f"tls_{p.edge_id}"
+                break
 
-    st.subheader("Carriles / sentidos")
-    st.caption("Por defecto: 1 carril (un vehículo de ancho). Marque dual para 2 carriles mismo sentido.")
-    edge_ids = []
-    if st.session_state.edges_gj:
-        edge_ids = [f["properties"]["id"] for f in st.session_state.edges_gj["features"]]
-    sel_edges = st.multiselect("Edges a ajustar", edge_ids[:500] if edge_ids else [])
-    dual = st.checkbox("Dos vías en un solo sentido (2 carriles)", value=False)
-    nlanes = st.number_input("Número de carriles", 1, 4, 1)
-    if st.button("Aplicar carriles a selección") and sel_edges:
-        for eid in sel_edges:
+    if target_tls:
+        st.caption(f"Aplicar tiempos a: `{target_tls}`")
+        if st.button("Aplicar estos tiempos al semáforo confirmado", type="primary"):
+            edits.tls_overrides[target_tls] = TlsTiming(int(green), int(yellow), int(red))
+            st.session_state.edits = edits
+            st.success(f"Tiempos aplicados a {target_tls}")
+            st.rerun()
+    else:
+        st.caption("Primero confirme un semáforo con el botón de arriba.")
+
+    st.subheader("3) Opciones extra del tramo (opcional)")
+    dual = st.checkbox(
+        "2 carriles en el MISMO sentido OSM (no abre el sentido contrario)",
+        value=False,
+    )
+    nlanes = st.number_input("Número de carriles", 1, 4, 2 if dual else 1)
+    side = st.selectbox("Lado de parqueo", ["right", "left", "both"])
+    clearance = st.number_input("Distancia legal esquina (m)", 3.0, 20.0, 5.0)
+    plen = st.number_input("Longitud zona parqueo (m)", 10.0, 200.0, 40.0)
+    cap = st.number_input("Capacidad parqueo", 1, 50, 8)
+
+    x1, x2 = st.columns(2)
+    with x1:
+        if st.button("Aplicar carriles al tramo", use_container_width=True, disabled=not eid):
             edits.lane_overrides = [x for x in edits.lane_overrides if x.edge_id != eid]
             edits.lane_overrides.append(
                 LaneOverride(edge_id=eid, num_lanes=int(nlanes), oneway_dual=dual)
             )
-        st.success(f"Actualizados {len(sel_edges)} edges")
-
-    st.subheader("Parqueo")
-    park_edge = st.selectbox("Edge para parqueo", ["—"] + (edge_ids[:500] if edge_ids else []))
-    side = st.selectbox("Lado", ["right", "left", "both"])
-    clearance = st.number_input("Distancia legal esquina (m)", 3.0, 20.0, 5.0)
-    plen = st.number_input("Longitud zona (m)", 10.0, 200.0, 40.0)
-    cap = st.number_input("Capacidad", 1, 50, 8)
-    if st.button("Agregar parqueo") and park_edge != "—":
-        edits.parking.append(
-            ParkingConfig(
-                edge_id=park_edge,
-                side=side,  # type: ignore
-                corner_clearance_m=float(clearance),
-                length_m=float(plen),
-                capacity=int(cap),
+            st.session_state.edits = edits
+            st.rerun()
+    with x2:
+        if st.button("Parqueo detallado al tramo", use_container_width=True, disabled=not eid):
+            edits.parking = [p for p in edits.parking if p.edge_id != eid]
+            edits.parking.append(
+                ParkingConfig(
+                    edge_id=eid,
+                    side=side,  # type: ignore
+                    corner_clearance_m=float(clearance),
+                    length_m=float(plen),
+                    capacity=int(cap),
+                )
             )
-        )
-        st.success("Parqueo agregado")
-    if edits.parking:
-        st.write([p.__dict__ for p in edits.parking])
+            st.session_state.edits = edits
+            st.rerun()
 
-    st.subheader("Señales de alto")
-    stop_edge = st.selectbox("Edge con alto", ["—"] + (edge_ids[:500] if edge_ids else []), key="stop_sel")
-    if st.button("Agregar alto") and stop_edge != "—":
-        edits.stops.append(StopSign(edge_id=stop_edge))
-        st.success("Alto agregado")
-    if edits.stops:
-        st.write([s.__dict__ for s in edits.stops])
+    with st.expander("Resumen de ediciones", expanded=False):
+        st.write("Semáforos confirmados", [t.__dict__ for t in edits.tls_placements])
+        st.write("Parqueos", [p.__dict__ for p in edits.parking])
+        st.write("Altos", [s.__dict__ for s in edits.stops])
+        st.write("Carriles", [x.__dict__ for x in edits.lane_overrides])
+        st.write("TLS tiempos", {k: v.__dict__ for k, v in edits.tls_overrides.items()})
 
     st.session_state.edits = edits
 
-    if st.session_state.net_path and st.button("Generar archivos SUMO adicionales", type="primary"):
+    tls_ids = [t["id"] for t in (st.session_state.tls_list or [])]
+    if st.session_state.net_path and st.button("Generar archivos SUMO adicionales"):
         run_dir = ROOT / "data" / "runs" / "current"
         run_dir.mkdir(parents=True, exist_ok=True)
-        paths = write_all_additionals(run_dir, edits, tls_ids)
+        paths = write_all_additionals(
+            run_dir, edits, tls_ids, net_path=Path(st.session_state.net_path)
+        )
         st.session_state.run_dir = run_dir
-        st.success("Generados: " + ", ".join(p.name for p in paths) if paths else "Sin archivos (nada configurado)")
+        st.success(
+            "Generados: " + ", ".join(p.name for p in paths) if paths else "Sin archivos (nada configurado)"
+        )
 
-    if st.button("Continuar a TomTom"):
-        st.session_state.step = STEPS[3]
-        st.rerun()
+    st.divider()
+    st.subheader("4) Guardar / cargar configuración de esta zona")
+    st.caption(
+        "La configuración (semáforos, altos, parqueos, carriles y tiempos) queda asociada al "
+        "**polígono de estudio**. Puede recuperarla en corridas posteriores desde aquí o la barra lateral."
+    )
+
+    default_name = f"{area.city}_{area.country}_config".replace(" ", "_")
+    scen_name = st.text_input(
+        "Nombre de la configuración",
+        value=st.session_state.get("scenario_name") or default_name,
+        key="cfg_scenario_name",
+    )
+    overwrite = st.checkbox(
+        "Sobrescribir si ya existe un escenario con el mismo nombre",
+        value=True,
+        key="cfg_scen_overwrite",
+    )
+
+    n_tls = len(edits.tls_placements)
+    n_park = len(edits.parking)
+    n_stop = len(edits.stops)
+    st.write(
+        f"Se guardará: **{n_tls}** semáforos · **{n_park}** parqueos · **{n_stop}** altos · "
+        f"polígono **{area.label}** ({area.area_km2:.2f} km²)"
+    )
+
+    g1, g2 = st.columns(2)
+    with g1:
+        if st.button("💾 Guardar configuración de zona", type="primary", use_container_width=True):
+            if not scen_name.strip():
+                st.error("Indique un nombre.")
+            else:
+                folder = save_scenario(
+                    scen_name.strip(),
+                    area,
+                    edits,
+                    net_path=st.session_state.net_path,
+                    edge_levels=st.session_state.edge_levels or {},
+                    edges_gj=st.session_state.edges_gj,
+                    tls_list=st.session_state.tls_list or [],
+                    overwrite=overwrite,
+                )
+                st.session_state.scenario_name = scen_name.strip()
+                st.session_state.scenario_folder = str(folder)
+                st.success(f"Configuración guardada en `{folder.name}` (ligada al polígono).")
+    with g2:
+        if st.button("Continuar a TomTom", use_container_width=True):
+            go_to(STEPS[3])
+
+    matches = scenarios_matching_area(area, min_iou=0.85)
+    if matches:
+        st.markdown("**Configuraciones ya guardadas para este (o casi el mismo) polígono:**")
+        opts = {
+            f"{m.get('name', folder.name)} · {folder.name} (IoU {iou:.0%})": folder
+            for folder, m, iou in matches
+        }
+        pick = st.selectbox("Cargar en esta zona", ["—"] + list(opts.keys()), key="cfg_match_pick")
+        if pick != "—" and st.button("Cargar configuración seleccionada", key="cfg_match_load"):
+            data = load_scenario(opts[pick])
+            apply_scenario_to_session(data, st.session_state)
+            st.success(f"Cargada: {data['meta'].get('name')}")
+            st.rerun()
+    else:
+        st.caption("No hay configuraciones previas que coincidan con este polígono.")
 
 
 def step_tomtom() -> None:
     st.header("4. Tráfico real TomTom")
     area = st.session_state.area
     if area is None or not st.session_state.edges_gj:
-        st.warning("Se requieren zona y red.")
+        st.warning("Se requieren zona y red. Genere la red en el paso 2.")
+        if st.button("Ir a Red OSM/SUMO"):
+            go_to(STEPS[1])
         return
+
+    levels = st.session_state.edge_levels or {}
+    # Mapa persistente: red base o congestión TomTom si ya hay datos
+    render_study_map(
+        title="Mapa de tráfico",
+        mode="tomtom" if levels else "plain",
+        value_by_id=levels or None,
+        show_tls=True,
+        key_prefix="tomtom",
+    )
 
     key = load_api_key()
-    if not key:
-        st.error("Configure `TOMTOM_API_KEY` en `.env` (copie `.env.example`).")
-        st.info("Sin TomTom puede continuar con densidad sintética en el siguiente paso.")
-        if st.button("Continuar sin TomTom"):
-            st.session_state.edge_levels = {}
-            st.session_state.step = STEPS[4]
-            st.rerun()
-        return
-
     used, limit = usage_count()
-    st.write(f"Uso del mes: **{used:,}** / {limit:,} tiles")
+    if key:
+        st.write(f"Uso del mes: **{used:,}** / {limit:,} tiles")
+    else:
+        st.warning("Sin `TOMTOM_API_KEY` en `.env`. Puede continuar con densidad sintética.")
 
-    zoom = st.slider("Zoom tiles", 13, 16, 15)
-    if st.button("Obtener flujo TomTom y calibrar edges", type="primary"):
-        with st.spinner("Descargando vector flow tiles…"):
-            try:
+    if levels:
+        pct = 100.0 * len(levels) / max(1, len(st.session_state.edges_gj["features"]))
+        st.metric("Edges calibrados", f"{len(levels)} ({pct:.0f}%)")
+    else:
+        st.caption("Aún sin calibración TomTom — el mapa muestra la red base.")
+
+    zoom = st.slider("Zoom tiles", 13, 16, 15, disabled=not bool(key))
+    col_a, col_b = st.columns(2)
+    with col_a:
+        fetch = st.button(
+            "Obtener flujo TomTom y calibrar edges",
+            type="primary",
+            disabled=not bool(key),
+            use_container_width=True,
+        )
+    with col_b:
+        cont = st.button(
+            "Continuar a simulación →",
+            use_container_width=True,
+            type="secondary",
+        )
+
+    if fetch and key:
+        st.info("Consultando TomTom… el mapa de arriba se actualizará al terminar.")
+        try:
+            with st.spinner("Descargando vector flow tiles y emparejando edges…"):
                 segs = fetch_traffic_for_bbox(area.bbox, api_key=key, zoom=zoom)
-                levels = match_traffic_to_edges(st.session_state.edges_gj, segs)
-                st.session_state.edge_levels = levels
+                new_levels = match_traffic_to_edges(st.session_state.edges_gj, segs)
+                st.session_state.edge_levels = new_levels
+                st.session_state.tomtom_segments = len(segs)
                 snap = ROOT / "data" / "cache" / "tomtom_snapshot.json"
-                save_snapshot(snap, levels)
-                pct = 100.0 * len(levels) / max(1, len(st.session_state.edges_gj["features"]))
-                st.success(
-                    f"{len(segs)} segmentos TomTom · {len(levels)} edges calibrados ({pct:.0f}%)"
-                )
-                m = base_map(area.center)
-                add_edges_layer(
-                    m,
-                    st.session_state.edges_gj,
-                    value_by_id=levels,
-                    mode="tomtom",
-                    name="Congestión TomTom",
-                )
-                try:
-                    from streamlit_folium import st_folium
-
-                    st_folium(m, width=None, height=480, key="tomtom_map")
-                except ImportError:
-                    st.write(segments_to_geojson(segs[:20]))
-            except Exception as e:
-                st.error(str(e))
-
-    if st.session_state.edge_levels:
-        st.metric("Edges calibrados", len(st.session_state.edge_levels))
-        if st.button("Continuar a simulación"):
-            st.session_state.step = STEPS[4]
+                save_snapshot(snap, new_levels)
+                _bump_map()
+            pct = 100.0 * len(new_levels) / max(1, len(st.session_state.edges_gj["features"]))
+            st.success(
+                f"{len(segs)} segmentos TomTom · {len(new_levels)} edges calibrados ({pct:.0f}%)"
+            )
             st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
+    if cont:
+        go_to(STEPS[4])
 
 
 def step_sim() -> None:
@@ -447,25 +1051,83 @@ def step_sim() -> None:
         st.warning("Faltan zona o red.")
         return
 
+    levels = st.session_state.edge_levels or {}
+    render_study_map(
+        title="Mapa de demanda / red",
+        mode="tomtom" if levels else "plain",
+        value_by_id=levels or None,
+        show_tls=True,
+        key_prefix="sim",
+    )
+
     sumo = detect_sumo()
     if not sumo.ok:
         st.error(sumo.message)
         return
 
-    duration = st.slider("Duración simulada (s)", 300, 3600, 1800, 300)
-    base_rate = st.slider("Densidad base (veh/h por edge semilla)", 20, 400, 120, 10)
+    duration = st.slider("Duración simulada (s)", 300, 3600, 600, 300)
+
+    st.info(
+        f"Modelo urbano: **máx. {CITY_MAX_SPEED_KMH:.0f} km/h**, vehículo **{VEH_LENGTH_M:.0f} m** + gap. "
+        "En hora pico TomTom baja la velocidad permitida del tramo y la demanda se limita "
+        "por capacidad física (~Greenshields), no solo por el escenario Bajo/Medio/Alto."
+    )
+
+    st.markdown("**Densidad de demanda (veh/h)**")
+    st.caption(
+        "Los edges SUMO son por sentido. TomTom escala dentro del tope del escenario y del "
+        "espacio vial (largo del tramo / 5 m+gap)."
+    )
+    dens_key = st.radio(
+        "Escenario",
+        options=list(DENSITY_SCENARIOS.keys()),
+        format_func=lambda k: DENSITY_SCENARIOS[k].caption,
+        horizontal=True,
+        index=1,  # Medio por defecto
+        key="density_scenario",
+    )
+    dens = get_density_scenario(dens_key)
+    st.dataframe(
+        {
+            "Escenario": ["Bajo", "Medio", "Alto"],
+            "Ambos sentidos": ["300–400", "500–700", "800–1.000"],
+            "Por sentido (tope)": ["150–200", "250–350", "400–500"],
+        },
+        hide_index=True,
+        use_container_width=True,
+    )
+    base_rate = st.slider(
+        f"Densidad base por sentido ({dens.label})",
+        dens.per_dir_min,
+        dens.per_dir_max,
+        dens.per_dir_default,
+        10,
+        key=f"density_base_{dens_key}",
+        help=(
+            f"Tope del escenario: {dens.per_dir_max} veh/h por sentido "
+            f"(≈ {dens.both_max} ambos sentidos)."
+        ),
+    )
 
     edges_gj = st.session_state.edges_gj or {}
     edge_ids = [f["properties"]["id"] for f in edges_gj.get("features", [])]
-    # Limit seeds for performance
     seeds = edge_ids[:: max(1, len(edge_ids) // 80)][:80] if edge_ids else []
 
     if st.button("Generar demanda y simular", type="primary"):
-        run_dir = ROOT / "data" / "runs" / "current"
+        # Use ASCII-safe run dir (OneDrive accents break SUMO/TraCI on Windows)
+        SAFE_RUNS.mkdir(parents=True, exist_ok=True)
+        run_dir = SAFE_RUNS / "current"
         run_dir.mkdir(parents=True, exist_ok=True)
         st.session_state.run_dir = run_dir
-        with st.spinner("Generando demanda calibrada…"):
-            try:
+        st.session_state.density_scenario_used = dens.key
+        st.session_state.density_base_rate = int(base_rate)
+        _close_traci()
+        status = st.empty()
+        status.info("Preparando demanda…")
+        try:
+            # Enforce 40 km/h on existing nets built before this change
+            cap_network_speeds(Path(net), max_speed_ms=CITY_MAX_SPEED_MS)
+            with st.spinner("Generando demanda calibrada…"):
                 routes = generate_demand(
                     Path(net),
                     run_dir,
@@ -473,60 +1135,74 @@ def step_sim() -> None:
                     edge_levels=st.session_state.edge_levels,
                     base_vehs_per_hour=float(base_rate),
                     duration_s=int(duration),
+                    max_vehs_per_hour=float(dens.per_dir_max),
+                    edges_gj=edges_gj,
                     sumo=sumo,
                 )
-            except Exception as e:
-                st.error(f"Demanda: {e}")
-                return
 
-        tls_ids = [t["id"] for t in (st.session_state.tls_list or [])]
-        adds = write_all_additionals(run_dir, st.session_state.edits, tls_ids)
-        add_files = [p for p in adds if p.suffix == ".xml" and "patch" not in p.name]
+            tls_ids = [t["id"] for t in (st.session_state.tls_list or [])]
+            adds = write_all_additionals(
+                run_dir, st.session_state.edits, tls_ids, net_path=Path(net)
+            )
+            add_files = [p for p in adds if p.suffix == ".xml" and "patch" not in p.name]
 
-        cfg = write_sumocfg(
-            run_dir / "optitraffic.sumocfg",
-            Path(net),
-            routes,
-            additional_files=add_files or None,
-            begin=0,
-            end=int(duration),
-        )
-        with st.spinner("Ejecutando SUMO (TraCI)…"):
-            try:
+            cfg = write_sumocfg(
+                run_dir / "optitraffic.sumocfg",
+                Path(net),
+                routes,
+                additional_files=add_files or None,
+                begin=0,
+                end=int(duration),
+            )
+            status.info(f"Ejecutando SUMO ({duration}s simulados)…")
+            with st.spinner("Ejecutando SUMO (TraCI)…"):
                 result = run_simulation(
                     cfg,
                     sumo=sumo,
                     edge_levels=st.session_state.edge_levels or None,
                 )
-                st.session_state.sim_result = result
-                export_edge_csv(result, run_dir / "edges.csv")
-                export_edge_geojson(edges_gj, result, run_dir / "edges_result.geojson")
-                (run_dir / "kpis.json").write_text(
-                    json.dumps(
-                        {
-                            "mean_speed": result.mean_speed,
-                            "pct_edges_congested": result.pct_edges_congested,
-                            "total_waiting": result.total_waiting,
-                            "tomtom_correlation": result.tomtom_correlation,
-                            "vehicle_steps": result.vehicle_steps,
-                        },
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
-                st.success("Simulación completada")
-                st.session_state.step = STEPS[5]
-                st.rerun()
-            except Exception as e:
-                st.error(f"Simulación: {e}")
-
+            st.session_state.sim_result = result
+            export_edge_csv(result, run_dir / "edges.csv")
+            export_edge_geojson(edges_gj, result, run_dir / "edges_result.geojson")
+            (run_dir / "kpis.json").write_text(
+                json.dumps(
+                    {
+                        "mean_speed": result.mean_speed,
+                        "pct_edges_congested": result.pct_edges_congested,
+                        "total_waiting": result.total_waiting,
+                        "tomtom_correlation": result.tomtom_correlation,
+                        "vehicle_steps": result.vehicle_steps,
+                        "density_scenario": dens.key,
+                        "density_base_veh_h": int(base_rate),
+                        "density_cap_veh_h": dens.per_dir_max,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            _bump_map()
+            status.success(
+                f"Simulación OK · veh-steps={result.vehicle_steps} · "
+                f"v_media={result.mean_speed:.2f} m/s"
+            )
+            go_to(STEPS[5])
+        except Exception as e:
+            _close_traci()
+            status.error(f"Simulación: {e}")
+            st.exception(e)
 
 def step_results() -> None:
     st.header("6. Resultados")
     result = st.session_state.sim_result
-    area = st.session_state.area
     if result is None:
         st.warning("Aún no hay resultados de simulación.")
+        if st.session_state.edges_gj:
+            render_study_map(
+                title="Mapa de red",
+                mode="tomtom" if st.session_state.edge_levels else "plain",
+                value_by_id=st.session_state.edge_levels or None,
+                key_prefix="res_empty",
+            )
         return
 
     k1, k2, k3, k4 = st.columns(4)
@@ -537,21 +1213,14 @@ def step_results() -> None:
     k4.metric("Corr. vs TomTom", f"{corr:.2f}" if corr is not None else "n/d")
 
     speeds = {eid: kpi.mean_speed for eid, kpi in result.edges.items()}
-    if area and st.session_state.edges_gj:
-        m = base_map(area.center)
-        add_edges_layer(
-            m,
-            st.session_state.edges_gj,
-            value_by_id=speeds,
-            mode="sim",
-            name="Congestión simulada",
-        )
-        try:
-            from streamlit_folium import st_folium
-
-            st_folium(m, width=None, height=500, key="res_map")
-        except ImportError:
-            pass
+    render_study_map(
+        title="Mapa de congestión simulada",
+        mode="sim",
+        value_by_id=speeds,
+        show_tls=True,
+        height=500,
+        key_prefix="res",
+    )
 
     run_dir = st.session_state.run_dir or (ROOT / "data" / "runs" / "current")
     c1, c2 = st.columns(2)
@@ -567,20 +1236,25 @@ def step_results() -> None:
         )
 
     name = st.text_input("Nombre del escenario", value=f"{st.session_state.city}_mvp")
-    if st.button("Guardar escenario", type="primary"):
+    overwrite = st.checkbox("Sobrescribir si existe el mismo nombre", value=False, key="res_overwrite")
+    if st.button("Guardar escenario (zona + config + resultados)", type="primary"):
         folder = save_scenario(
             name,
-            area,
+            st.session_state.area,
             st.session_state.edits,
             net_path=st.session_state.net_path,
             edge_levels=st.session_state.edge_levels,
+            edges_gj=st.session_state.edges_gj,
+            tls_list=st.session_state.tls_list or [],
             result_summary={
                 "mean_speed": result.mean_speed,
                 "pct_edges_congested": result.pct_edges_congested,
                 "tomtom_correlation": result.tomtom_correlation,
             },
             extra_files=[csv_path, gj_path] if csv_path.exists() else None,
+            overwrite=overwrite,
         )
+        st.session_state.scenario_folder = str(folder)
         st.success(f"Guardado en {folder}")
 
 
