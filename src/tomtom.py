@@ -14,6 +14,10 @@ import requests
 from dotenv import load_dotenv
 from shapely.geometry import LineString, shape
 
+from .logging_config import get_logger
+
+log = get_logger("tomtom")
+
 _ROOT = Path(__file__).resolve().parents[1]
 _ENV_FILE = _ROOT / ".env"
 DATA_DIR = _ROOT / "data"
@@ -207,6 +211,7 @@ def _is_empty_flow_tile(pbf_bytes: bytes) -> bool:
             return True
         return sum(len(v.get("features") or []) for v in tile.values()) == 0
     except Exception:
+        log.warning("No se pudo decodificar tile PBF para detectar vacío", exc_info=True)
         return False
 
 
@@ -238,6 +243,7 @@ def decode_flow_tile(pbf_bytes: bytes) -> list[TrafficSegment]:
             try:
                 g = shape(geom)
             except Exception:
+                log.debug("Geometría TomTom inválida en feature, se descarta", exc_info=True)
                 continue
             if g.is_empty:
                 continue
@@ -423,6 +429,7 @@ def match_traffic_to_edges(
         try:
             geom = shape(feat["geometry"])
         except Exception:
+            log.warning("Edge %s con geometría inválida, se omite del match TomTom", eid, exc_info=True)
             continue
         if geom.is_empty:
             continue
@@ -432,6 +439,9 @@ def match_traffic_to_edges(
         try:
             idxs = tree.query(window)
         except Exception:
+            log.warning(
+                "STRtree.query falló para edge %s; cae a escaneo O(n) completo", eid, exc_info=True
+            )
             idxs = []
         best = None
         best_d = 1e9

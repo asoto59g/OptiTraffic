@@ -16,6 +16,9 @@ from typing import Any, Optional
 from .traffic_params import CITY_MAX_SPEED_MS, CONGESTION_SPEED_MS, desired_speed_ms
 from .osm_fetch import SAFE_ROOT, path_is_safe, to_safe_path
 from .sumo_env import SumoEnv, detect_sumo, ensure_sumolib_on_path
+from .logging_config import get_logger
+
+log = get_logger("simulate")
 
 SAFE_RUNS = SAFE_ROOT / "runs"
 
@@ -113,11 +116,11 @@ def _close_traci(label: str = "optitraffic") -> None:
             traci.switch(lab)
             traci.close(wait=False)
         except Exception:
-            pass
+            log.debug("_close_traci: no active connection for label %r", lab, exc_info=True)
     try:
         traci.close(wait=False)
     except Exception:
-        pass
+        log.debug("_close_traci: default close no-op", exc_info=True)
     time.sleep(0.3)
 
 
@@ -506,6 +509,7 @@ def _capture_hwnd_png(hwnd: int, dest: Path) -> bool:
     try:
         from PIL import ImageGrab
     except ImportError:
+        log.debug("Pillow no disponible: no se puede grabar video de sumo-gui")
         return False
     try:
         try:
@@ -515,6 +519,7 @@ def _capture_hwnd_png(hwnd: int, dest: Path) -> bool:
         img.save(dest, format="PNG")
         return dest.exists() and dest.stat().st_size > 1000
     except Exception:
+        log.debug("Captura de hwnd %s falló (PrintWindow e ImageGrab)", hwnd, exc_info=True)
         return False
 
 
@@ -603,13 +608,15 @@ def run_simulation(
 
     try:
         traci.start(cmd, label=label)
-    except Exception:
+    except Exception as e1:
+        log.warning("traci.start primer intento falló, reintentando: %s", e1)
         _close_traci(label)
         time.sleep(0.5)
         try:
             traci.start(cmd, label=label)
         except Exception as e2:
             detail = _sumo_stderr_probe(bin_path, cfg_safe)
+            log.error("traci.start reintento también falló: %s | SUMO: %s", e2, detail)
             raise RuntimeError(
                 f"No se pudo iniciar SUMO/TraCI: {e2}. Detalle SUMO: {detail}"
             ) from e2
@@ -670,8 +677,10 @@ def run_simulation(
     try:
         end = float(traci.simulation.getEndTime())
     except Exception:
+        log.warning("traci.simulation.getEndTime() falló, usando 1800s por defecto", exc_info=True)
         end = 1800.0
     if end <= 0 or end > 1e7:
+        log.warning("getEndTime() devolvió %s fuera de rango, usando 1800s", end)
         end = 1800.0
     if warmup >= end * 0.85:
         warmup = max(0.0, end * 0.2)
@@ -750,6 +759,8 @@ def run_simulation(
                     speed_samples += 1
                     eid = traci.vehicle.getRoadID(vid)
                 except traci.TraCIException:
+                    # Expected: vehicle can despawn between getIDList() and the query.
+                    # No logging here on purpose — fires routinely, would flood logs.
                     continue
                 if not eid or eid.startswith(":"):
                     continue
@@ -775,7 +786,7 @@ def run_simulation(
         try:
             traci.close(wait=False)
         except Exception:
-            pass
+            log.debug("traci.close(wait=False) en finally no-op", exc_info=True)
         _close_traci(label)
 
     edges: dict[str, EdgeKPI] = {}
@@ -831,6 +842,7 @@ def run_simulation(
             encode_frames_to_mp4(frames_path, dest_video, fps=float(video_fps))
             out_video = str(dest_video)
         except Exception as e:
+            log.warning("encode_frames_to_mp4 falló (%d frames): %s", frame_i, e)
             video_note = f"; video: {e}"
     elif use_gui and frame_i == 0:
         video_note = (
