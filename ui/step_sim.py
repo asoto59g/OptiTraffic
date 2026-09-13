@@ -45,6 +45,7 @@ from src.simulate import (  # noqa: E402
     write_sumocfg,
 )
 from src.sumo_env import detect_sumo  # noqa: E402
+from src.sumo_background import fetch_sumo_background, write_gui_viewsettings  # noqa: E402
 from src.traffic_params import CITY_MAX_SPEED_KMH, CITY_MAX_SPEED_MS, VEH_LENGTH_M  # noqa: E402
 from src.wizard_state import STEPS  # noqa: E402
 from ui.common import (  # noqa: E402
@@ -431,6 +432,34 @@ def step_sim() -> None:
         f"Medición de KPIs: {int(duration - warmup)} s útiles tras {int(warmup)} s de llenado."
     )
 
+    st.markdown("**Fondo de mapa (sumo-gui)**")
+    bg_choice = st.radio(
+        "Mapa base al generar el proyecto SUMO",
+        options=["osm", "satellite", "ninguno"],
+        format_func=lambda k: {
+            "osm": "OpenStreetMap (calles)",
+            "satellite": "Satélite (Esri World Imagery)",
+            "ninguno": "Sin fondo",
+        }[k],
+        horizontal=True,
+        index=0,
+        key="sumo_bg_style",
+        help=(
+            "Descarga teselas con la herramienta tileGet de SUMO y las embebe en "
+            "viewsettings para sumo-gui y al guardar el escenario."
+        ),
+    )
+    bg_tiles = st.slider(
+        "Máx. teselas de fondo",
+        9,
+        64,
+        36,
+        1,
+        key="sumo_bg_tiles",
+        disabled=bg_choice == "ninguno",
+        help="Más teselas = más detalle y descarga más lenta.",
+    )
+
     st.markdown("**Grabación de video**")
     gui_ok = bool(getattr(sumo, "sumo_gui_bin", None))
     ff_ok = find_ffmpeg() is not None
@@ -583,6 +612,45 @@ def step_sim() -> None:
             )
             add_files = [p for p in adds if p.suffix == ".xml" and "patch" not in p.name]
 
+            gui_settings = None
+            if bg_choice in ("osm", "satellite"):
+                status.info(f"Descargando fondo de mapa ({bg_choice})…")
+                with st.spinner(f"Descargando teselas {bg_choice} para sumo-gui…"):
+                    gui_settings = fetch_sumo_background(
+                        sim_net,
+                        run_dir / "background",
+                        style=bg_choice,  # type: ignore[arg-type]
+                        max_tiles=int(bg_tiles),
+                        sumo=sumo,
+                        force=False,
+                    )
+                # Reuse fondo del paso 2 si la descarga a runs/current falló
+                if not gui_settings:
+                    prev = st.session_state.get("background_dir")
+                    if prev and Path(prev).is_dir() and (Path(prev) / "viewsettings_bg.xml").is_file():
+                        import shutil
+
+                        dest_bg = run_dir / "background"
+                        dest_bg.mkdir(parents=True, exist_ok=True)
+                        for f in Path(prev).iterdir():
+                            if f.is_file():
+                                shutil.copy2(f, dest_bg / f.name)
+                        if (dest_bg / "viewsettings_bg.xml").is_file():
+                            gui_settings = dest_bg / "viewsettings_bg.xml"
+                if gui_settings:
+                    st.session_state.background_dir = str(run_dir / "background")
+                    st.caption(f"Fondo listo: `{gui_settings}`")
+                else:
+                    st.warning(
+                        "No se pudo descargar el fondo (¿SUMO tileGet.py / red?). "
+                        "La simulación continúa sin mapa base."
+                    )
+            elif record_video and gui_ok:
+                gui_settings = write_gui_viewsettings(
+                    run_dir / "viewsettings_record.xml",
+                    delay_ms=100,
+                )
+
             cfg = write_sumocfg(
                 run_dir / "optitraffic.sumocfg",
                 sim_net,
@@ -590,6 +658,7 @@ def step_sim() -> None:
                 additional_files=add_files or None,
                 begin=0,
                 end=int(duration),
+                gui_settings_file=gui_settings,
             )
             status.info(
                 f"Ejecutando SUMO ({duration}s · warmup {warmup}s"

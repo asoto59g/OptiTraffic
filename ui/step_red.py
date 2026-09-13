@@ -25,11 +25,13 @@ from src.network_build import (  # noqa: E402
 )
 from src.osm_fetch import (  # noqa: E402
     MAX_GEOFABRIK_PBF_BYTES,
+    SAFE_ROOT,
     geofabrik_url,
     listed_countries,
     prepare_clipped_osm,
     resolve_geofabrik_path,
 )
+from src.sumo_background import fetch_sumo_background  # noqa: E402
 from src.sumo_env import detect_sumo  # noqa: E402
 from src.wizard_state import STEPS  # noqa: E402
 from ui.common import (  # noqa: E402
@@ -96,6 +98,19 @@ def step_red() -> None:
         st.warning(str(e))
         st.caption("Países con extracto mapeado: " + ", ".join(listed_countries()[:20]) + "…")
 
+    bg_on_build = st.radio(
+        "Fondo sumo-gui al generar la red",
+        options=["osm", "satellite", "ninguno"],
+        format_func=lambda k: {
+            "osm": "OpenStreetMap",
+            "satellite": "Satélite",
+            "ninguno": "Omitir (se puede pedir en simulación)",
+        }[k],
+        horizontal=True,
+        index=0,
+        key="bg_on_build",
+    )
+
     sumo = detect_sumo()
     if st.button("Descargar OSM, recortar y generar red SUMO", type="primary"):
         if not sumo.ok:
@@ -150,12 +165,34 @@ def step_red() -> None:
             n_def = int(st.session_state.get("_default_stops_applied") or 0)
             n_lane = int(st.session_state.get("_default_lanes_applied") or 0)
             n_park = int(st.session_state.get("_default_parking_applied") or 0)
+            bg_msg = ""
+            if bg_on_build in ("osm", "satellite"):
+                status.info(f"Descargando fondo {bg_on_build} para sumo-gui…")
+                try:
+                    with st.spinner(f"Teselas {bg_on_build}…"):
+                        bg_dir = SAFE_ROOT / "background" / Path(net).stem
+                        bg_settings = fetch_sumo_background(
+                            Path(net),
+                            bg_dir,
+                            style=bg_on_build,  # type: ignore[arg-type]
+                            max_tiles=36,
+                            sumo=sumo,
+                            force=bool(force),
+                        )
+                    if bg_settings:
+                        st.session_state.background_dir = str(bg_dir)
+                        bg_msg = f" · fondo {bg_on_build} OK"
+                    else:
+                        bg_msg = " · fondo no disponible"
+                except Exception:
+                    bg_msg = " · fondo falló"
             st.success(
                 f"Red generada: {net} ({len(gj.get('features', []))} edges) · "
                 f"sentido único={stats.get('oneway_edges', '?')} · "
                 f"doble={stats.get('twoway_edges', '?')} · "
                 f"altos default N–S={n_def} · "
                 f"1 carril default={n_lane} · parqueo der. lleno={n_park}"
+                f"{bg_msg}"
             )
             st.rerun()
         except Exception as e:

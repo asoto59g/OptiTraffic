@@ -30,6 +30,7 @@ _SUMO_PROJECT_FILES = (
     "stops.add.xml",
     "parking.add.xml",
     "viewsettings_record.xml",
+    "viewsettings_bg.xml",
     "kpis.json",
 )
 
@@ -63,6 +64,20 @@ def package_sumo_project(run_dir: Path, dest_dir: Path) -> Optional[Path]:
         if src.is_file():
             shutil.copy2(src, dest_dir / name)
 
+    # Portable OSM/satellite background (tiles + rewritten viewsettings)
+    bg_src = run_dir / "background"
+    gui_settings_name: Optional[str] = None
+    if bg_src.is_dir() and (bg_src / "viewsettings_bg.xml").is_file():
+        from .sumo_background import copy_background_into_project
+
+        bg_settings = copy_background_into_project(bg_src, dest_dir, subdir="background")
+        if bg_settings is not None:
+            gui_settings_name = bg_settings.name
+    elif (dest_dir / "viewsettings_bg.xml").is_file():
+        gui_settings_name = "viewsettings_bg.xml"
+    elif (dest_dir / "viewsettings_record.xml").is_file():
+        gui_settings_name = "viewsettings_record.xml"
+
     # Fallback net name if sim.net.xml missing (older runs)
     net_name = "sim.net.xml"
     if not (dest_dir / net_name).is_file():
@@ -91,7 +106,7 @@ def package_sumo_project(run_dir: Path, dest_dir: Path) -> Optional[Path]:
     routes_name = "routes.rou.xml" if (dest_dir / "routes.rou.xml").is_file() else "trips.xml"
     add_names = [
         n
-        for n in ("tls.add.xml", "stops.add.xml", "parking.add.xml", "viewsettings_record.xml")
+        for n in ("tls.add.xml", "stops.add.xml", "parking.add.xml")
         if (dest_dir / n).is_file()
     ]
 
@@ -123,9 +138,9 @@ def package_sumo_project(run_dir: Path, dest_dir: Path) -> Optional[Path]:
     ET.SubElement(proc, "time-to-teleport", value="120")
     ET.SubElement(proc, "collision.action", value="warn")
     ET.SubElement(proc, "ignore-junction-blocker", value="0")
-    if (dest_dir / "viewsettings_record.xml").is_file():
+    if gui_settings_name and (dest_dir / gui_settings_name).is_file():
         gui = ET.SubElement(root, "gui_only")
-        ET.SubElement(gui, "gui-settings-file", value="viewsettings_record.xml")
+        ET.SubElement(gui, "gui-settings-file", value=gui_settings_name)
 
     cfg_out = dest_dir / "optitraffic.sumocfg"
     ET.ElementTree(root).write(cfg_out, encoding="utf-8", xml_declaration=True)

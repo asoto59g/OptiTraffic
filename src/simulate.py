@@ -58,6 +58,7 @@ def write_sumocfg(
     additional_files: Optional[list[Path]] = None,
     begin: int = 0,
     end: int = 1800,
+    gui_settings_file: Optional[Path] = None,
 ) -> Path:
     # Native SUMO on Windows fails with non-ASCII paths (OneDrive "Geomática")
     net_safe = net_path if path_is_safe(net_path) else to_safe_path(net_path)
@@ -66,6 +67,13 @@ def write_sumocfg(
     if additional_files:
         for p in additional_files:
             add_safe.append(p if path_is_safe(p) else to_safe_path(p))
+    gui_safe: Optional[Path] = None
+    if gui_settings_file and Path(gui_settings_file).is_file():
+        gui_safe = (
+            gui_settings_file
+            if path_is_safe(gui_settings_file)
+            else to_safe_path(gui_settings_file)
+        )
 
     if not path_is_safe(cfg_path):
         SAFE_RUNS.mkdir(parents=True, exist_ok=True)
@@ -85,6 +93,17 @@ def write_sumocfg(
     ET.SubElement(proc, "time-to-teleport", value="120")
     ET.SubElement(proc, "collision.action", value="warn")
     ET.SubElement(proc, "ignore-junction-blocker", value="0")
+    if gui_safe is not None:
+        gui = ET.SubElement(root, "gui_only")
+        try:
+            gui_val = str(Path(gui_safe).resolve().relative_to(Path(cfg_path).resolve().parent))
+        except ValueError:
+            gui_val = str(gui_safe)
+        ET.SubElement(
+            gui,
+            "gui-settings-file",
+            value=gui_val.replace("\\", "/"),
+        )
 
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     ET.ElementTree(root).write(cfg_path, encoding="utf-8", xml_declaration=True)
@@ -622,7 +641,20 @@ def run_simulation(
     ]
     if use_gui:
         settings_dir = Path(frames_dir).parent if frames_dir else (SAFE_RUNS / "current")
-        gui_settings = _write_record_gui_settings(settings_dir / "viewsettings_record.xml")
+        bg_decals = settings_dir / "background" / "viewsettings_decals.xml"
+        if not bg_decals.is_file():
+            bg_decals = settings_dir / "background" / "viewsettings_bg.xml"
+        try:
+            from .sumo_background import write_gui_viewsettings
+
+            gui_settings = write_gui_viewsettings(
+                settings_dir / "viewsettings_record.xml",
+                decals_xml=bg_decals if bg_decals.is_file() else None,
+                delay_ms=100,
+            )
+        except Exception:
+            log.warning("No se pudo combinar fondo con viewsettings de grabación", exc_info=True)
+            gui_settings = _write_record_gui_settings(settings_dir / "viewsettings_record.xml")
         cmd.extend(
             [
                 "--gui-settings-file",
