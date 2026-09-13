@@ -11,7 +11,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.demand import DENSITY_SCENARIOS, generate_demand, get_density_scenario  # noqa: E402
+from src.demand import (  # noqa: E402
+    DENSITY_SCENARIOS,
+    generate_demand,
+    get_density_scenario,
+    sort_demand_xml,
+)
 from src.flow_gates import (  # noqa: E402
     FlowGate,
     edge_midpoint,
@@ -450,8 +455,9 @@ def step_sim() -> None:
     video_fps = 5.0
     if record_video and gui_ok:
         st.warning(
-            "La grabación espera a que haya **vehículos**, enfoca la cámara en el tráfico "
-            "y recién entonces captura. Deje sumo-gui visible; el MP4 se arma al final. "
+            "La grabación espera a que haya **vehículos**, enfoca el **punto con más tráfico** "
+            "y alterna acercamiento/alejamiento cada **30 s** de simulación. "
+            "Deje sumo-gui visible; el MP4 se arma al final. "
             "Con grabación la simulación es más lenta (~100 ms/paso)."
         )
         rc1, rc2 = st.columns(2)
@@ -492,7 +498,31 @@ def step_sim() -> None:
         dens.per_dir_default,
         10,
         key=f"density_base_{dens_key}",
+        disabled=bool(gates),
     )
+    preload_vph = st.number_input(
+        "Precarga de red (veh/h internos)",
+        min_value=0,
+        max_value=2000,
+        value=100,
+        step=25,
+        key="preload_vph",
+        disabled=not bool(gates),
+        help=(
+            "Con puertas: viajes internos fijos (OD aleatorio) además de las entradas. "
+            "~70% sale al inicio para llenar la red rápido; el resto se reparte en el resto "
+            "de la simulación. 0 = solo puertas. Sin puertas no aplica (use densidad base)."
+        ),
+    )
+    if gates:
+        st.caption(
+            f"Precarga ≈ **{int(preload_vph)}** veh/h internos + Σ entradas "
+            f"**{sum(g.vehs_per_hour for g in gates if g.kind == 'entry'):.0f}** veh/h. "
+            f"Ventana de llenado temprano ≈ **{min(int(duration), max(300, int(duration * 0.25)))}** s "
+            f"(alineada al warmup cuando sea posible)."
+        )
+    else:
+        st.caption("Active puertas de entrada/salida para usar la precarga fija de red.")
 
     edge_ids = [f["properties"]["id"] for f in edges_gj.get("features", []) if f.get("properties", {}).get("id")]
     seeds = edge_ids[:: max(1, len(edge_ids) // 80)][:80] if edge_ids else []
@@ -504,6 +534,7 @@ def step_sim() -> None:
         st.session_state.run_dir = run_dir
         st.session_state.density_scenario_used = dens.key
         st.session_state.density_base_rate = int(base_rate)
+        st.session_state.preload_vph_used = int(preload_vph) if gates else 0
         _close_traci()
         status = st.empty()
         status.info("Preparando demanda…")
@@ -522,8 +553,9 @@ def step_sim() -> None:
                     netconvert_bin=sumo.netconvert_bin,
                 )
             cap_network_speeds(sim_net, max_speed_ms=CITY_MAX_SPEED_MS)
+            preload_fill = float(min(int(duration), max(300, int(warmup)))) if gates else None
             with st.spinner(
-                "Generando demanda OD (puertas)…"
+                "Generando demanda OD (puertas + precarga)…"
                 if gates
                 else "Generando demanda calibrada…"
             ):
@@ -538,7 +570,13 @@ def step_sim() -> None:
                     edges_gj=edges_gj,
                     sumo=sumo,
                     flow_gates=gates or None,
+                    preload_vph=float(preload_vph) if gates else 0.0,
+                    preload_fill_s=preload_fill,
                 )
+            # Belt-and-suspenders: never hand SUMO an unsorted route file
+            sort_demand_xml(run_dir / "trips.xml")
+            sort_demand_xml(Path(routes))
+
 
             adds = write_all_additionals(
                 run_dir, st.session_state.edits, tls_ids, net_path=sim_net
@@ -597,6 +635,7 @@ def step_sim() -> None:
                         "density_scenario": dens.key,
                         "density_base_veh_h": int(base_rate),
                         "density_cap_veh_h": dens.per_dir_max,
+                        "preload_vph": int(preload_vph) if gates else 0,
                         "duration_s": int(duration),
                         "warmup_s": int(warmup),
                         "flow_gates": gates_to_list(gates),

@@ -80,6 +80,81 @@ def get_density_scenario(key: str) -> DensityScenario:
     return DENSITY_SCENARIOS.get(key, DENSITY_SCENARIOS["medio"])
 
 
+def _depart_key(elem: ET.Element) -> float:
+    raw = elem.get("depart")
+    if raw is None:
+        raw = elem.get("begin")
+    try:
+        return float(raw or 0.0)
+    except ValueError:
+        return 0.0
+
+
+def sort_demand_xml(path: Path) -> Path:
+    """
+    SUMO loads route/trip files incrementally and *ignores* vehicles whose
+    depart time goes backwards in the file. Always keep trip/vehicle/flow
+    elements sorted by depart/begin.
+    """
+    if not path.is_file():
+        return path
+    tree = ET.parse(path)
+    root = tree.getroot()
+    movable_tags = {"trip", "vehicle", "flow"}
+    head: list[ET.Element] = []
+    movable: list[ET.Element] = []
+    for child in list(root):
+        if child.tag in movable_tags:
+            movable.append(child)
+        else:
+            head.append(child)
+    # Already sorted? still rewrite for a stable on-disk order.
+    movable.sort(key=_depart_key)
+    for child in list(root):
+        root.remove(child)
+    for child in head:
+        root.append(child)
+    for child in movable:
+        root.append(child)
+    # Atomic replace avoids readers seeing a half-written unsorted file.
+    tmp = path.with_suffix(path.suffix + ".sorting")
+    tree.write(tmp, encoding="utf-8", xml_declaration=True)
+    tmp.replace(path)
+    return path
+
+
+def assert_demand_sorted(path: Path) -> None:
+    """Raise if trip/vehicle/flow depart times are not non-decreasing."""
+    if not path.is_file():
+        return
+    prev = -1.0
+    for _ev, el in ET.iterparse(path, events=("end",)):
+        if el.tag not in ("trip", "vehicle", "flow"):
+            el.clear()
+            continue
+        d = _depart_key(el)
+        if d + 1e-9 < prev:
+            raise RuntimeError(
+                f"Archivo de demanda no ordenado por depart: {path.name} "
+                f"(prev={prev}, got={d}, id={el.get('id')}). "
+                "SUMO ignoraría la mayoría de vehículos."
+            )
+        prev = d
+        el.clear()
+
+
+def _write_sorted_trips(out_path: Path, root: ET.Element, trips: list[ET.Element]) -> Path:
+    """Attach trips sorted by depart and write atomically."""
+    trips_sorted = sorted(trips, key=_depart_key)
+    for t in trips_sorted:
+        root.append(t)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    ET.ElementTree(root).write(tmp, encoding="utf-8", xml_declaration=True)
+    tmp.replace(out_path)
+    return out_path
+
+
 def _edge_meta_from_geojson(edges_gj: Optional[dict]) -> dict[str, tuple[float, float]]:
     """id -> (length_m, lanes)."""
     out: dict[str, tuple[float, float]] = {}
@@ -187,6 +262,7 @@ def write_trips(
 
     trip_id = 0
     duration = max(1, end - begin)
+    pending: list[ET.Element] = []
     for i, eid in enumerate(edge_ids):
         level = edge_levels.get(eid)
         factor = traffic_level_to_demand_factor(level, 1.0) if level is not None else 1.0
@@ -220,16 +296,14 @@ def write_trips(
             trip.set("departLane", "best")
             trip.set("departSpeed", "avg")
             trip.set("speedFactor", f"{speed_factor:.3f}")
-            root.append(trip)
+            pending.append(trip)
             trip_id += 1
             if trip_id >= max_trips:
                 break
         if trip_id >= max_trips:
             break
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    ET.ElementTree(root).write(out_path, encoding="utf-8", xml_declaration=True)
-    return out_path
+    return _write_sorted_trips(out_path, root, pending)
 
 
 def write_gate_trips(
@@ -243,17 +317,20 @@ def write_gate_trips(
     max_trips: int = 40000,
     edges_gj: Optional[dict] = None,
     city_max_speed_ms: float = CITY_MAX_SPEED_MS,
-    internal_fraction: float = 0.12,
-    base_internal_vph: float = 80.0,
+    preload_vph: float = 100.0,
+    preload_fill_s: Optional[float] = None,
+    preload_frontload: float = 0.7,
     seed: int = 42,
 ) -> Path:
     """
-    OD demand from entry → exit gates (plus a small internal background).
+    OD demand from entry → exit gates, plus fixed internal preload.
 
     - Entries inject vehicles at their veh/h into the network.
     - Destinations prefer exits (weighted by exit veh/h); if no exits, random
       distant edges.
     - Exits alone: origins sampled from network → each exit.
+    - preload_vph: internal OD rate (veh/h) so the grid is not empty when
+      entry loads arrive; most trips are front-loaded into an early fill window.
     """
     edge_levels = edge_levels or {}
     scenario_cap = float(max_vehs_per_hour) if max_vehs_per_hour is not None else None
@@ -267,6 +344,7 @@ def write_gate_trips(
     trip_id = 0
     gate_edge_ids = {g.edge_id for g in gates}
     pool = [e for e in all_edge_ids if e not in gate_edge_ids] or list(all_edge_ids)
+    pending: list[ET.Element] = []
 
     def _speed_factor_for(eid: str) -> float:
         level = edge_levels.get(eid)
@@ -288,7 +366,7 @@ def write_gate_trips(
         trip.set("departLane", "best")
         trip.set("departSpeed", "avg")
         trip.set("speedFactor", f"{_speed_factor_for(frm):.3f}")
-        root.append(trip)
+        pending.append(trip)
         trip_id += 1
 
     exit_ids = [g.edge_id for g in exits]
@@ -338,22 +416,30 @@ def write_gate_trips(
             if trip_id >= max_trips:
                 break
 
-    # Light internal background so the grid is not empty between corridors
-    if pool and internal_fraction > 0 and trip_id < max_trips:
-        n_int = max(
-            0,
-            int(base_internal_vph * internal_fraction * duration / 3600.0 * max(1, len(entries) + len(exits))),
-        )
-        n_int = min(n_int, max(0, max_trips - trip_id))
-        for k in range(n_int):
+    # Fixed internal preload (veh/h) — mostly early so corridors fill before entry peaks matter
+    if pool and preload_vph > 0 and trip_id < max_trips:
+        n_pre = max(0, int(float(preload_vph) * duration / 3600.0))
+        n_pre = min(n_pre, max(0, max_trips - trip_id))
+        fill_s = preload_fill_s
+        if fill_s is None:
+            fill_s = float(min(duration, max(300, int(duration * 0.25))))
+        fill_s = max(60.0, min(float(duration), float(fill_s)))
+        front = max(0.0, min(1.0, float(preload_frontload)))
+        n_early = int(n_pre * front) if duration > fill_s else n_pre
+        n_late = n_pre - n_early
+        for k in range(n_early):
             frm = rng.choice(pool)
             to = rng.choice(pool)
-            depart = begin + (k * duration) / max(1, n_int)
+            depart = begin + (k * fill_s) / max(1, n_early)
+            _add_trip(frm, to, depart)
+        late_span = max(1.0, float(duration) - fill_s)
+        for k in range(n_late):
+            frm = rng.choice(pool)
+            to = rng.choice(pool)
+            depart = begin + fill_s + (k * late_span) / max(1, n_late)
             _add_trip(frm, to, depart)
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    ET.ElementTree(root).write(out_path, encoding="utf-8", xml_declaration=True)
-    return out_path
+    return _write_sorted_trips(out_path, root, pending)
 
 
 def run_duarouter(
@@ -398,6 +484,8 @@ def run_duarouter(
     r = run_cmd(args, timeout=600)
     if r.returncode != 0 and not routes_out.exists():
         raise RuntimeError("duarouter falló:\n" + (r.stderr or r.stdout))
+    if routes_out.exists():
+        sort_demand_xml(routes_out)
     return routes_out
 
 
@@ -412,11 +500,13 @@ def generate_demand(
     edges_gj: Optional[dict] = None,
     sumo: Optional[SumoEnv] = None,
     flow_gates: Optional[Sequence[FlowGate]] = None,
+    preload_vph: float = 100.0,
+    preload_fill_s: Optional[float] = None,
 ) -> Path:
     """Create trips + routed .rou.xml. Returns routes path.
 
-    If flow_gates is non-empty, uses entry/exit OD demand; otherwise legacy
-    seed-edge demand.
+    If flow_gates is non-empty, uses entry/exit OD demand + internal preload;
+    otherwise legacy seed-edge demand.
     """
     work_dir.mkdir(parents=True, exist_ok=True)
     trips = work_dir / "trips.xml"
@@ -432,6 +522,8 @@ def generate_demand(
             end=duration_s,
             max_vehs_per_hour=max_vehs_per_hour,
             edges_gj=edges_gj,
+            preload_vph=float(preload_vph),
+            preload_fill_s=preload_fill_s,
         )
     else:
         write_trips(
@@ -445,6 +537,13 @@ def generate_demand(
             edges_gj=edges_gj,
         )
     try:
-        return run_duarouter(net_path, trips, routes, sumo=sumo)
+        routes_path = run_duarouter(net_path, trips, routes, sumo=sumo)
     except Exception:
-        return trips
+        routes_path = trips
+    # Hard guarantee: SUMO silently drops unsorted demand.
+    sort_demand_xml(trips)
+    if routes_path != trips:
+        sort_demand_xml(routes_path)
+    assert_demand_sorted(trips)
+    assert_demand_sorted(routes_path)
+    return routes_path

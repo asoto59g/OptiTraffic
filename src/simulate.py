@@ -347,21 +347,27 @@ def _write_record_gui_settings(path: Path) -> Path:
     return path
 
 
-def _focus_gui_on_traffic(view_id: str = "View #0", *, pad_m: float = 160.0) -> bool:
-    """Zoom to a street block around traffic so real-scale cars stay visible in frames."""
+def _traffic_hotspot(
+    max_sample: int = 250,
+    cell_m: float = 90.0,
+) -> Optional[tuple[float, float]]:
+    """Return (x, y) of the densest vehicle cluster, or None if no traffic."""
     try:
         import traci
     except Exception:
-        return False
+        return None
     try:
         vehs = list(traci.vehicle.getIDList())
     except Exception:
-        return False
+        return None
     if not vehs:
-        return False
+        return None
+    if len(vehs) > max_sample:
+        step = max(1, len(vehs) // max_sample)
+        vehs = vehs[::step][:max_sample]
     xs: list[float] = []
     ys: list[float] = []
-    for vid in vehs[:60]:
+    for vid in vehs:
         try:
             x, y = traci.vehicle.getPosition(vid)
             xs.append(float(x))
@@ -369,13 +375,44 @@ def _focus_gui_on_traffic(view_id: str = "View #0", *, pad_m: float = 160.0) -> 
         except Exception:
             continue
     if not xs:
+        return None
+    if len(xs) == 1:
+        return xs[0], ys[0]
+
+    # Grid density: center on the cell with most vehicles (true hotspot).
+    inv = 1.0 / max(10.0, cell_m)
+    buckets: dict[tuple[int, int], list[tuple[float, float]]] = {}
+    for x, y in zip(xs, ys):
+        key = (int(x * inv), int(y * inv))
+        buckets.setdefault(key, []).append((x, y))
+    best = max(buckets.values(), key=len)
+    cx = sum(p[0] for p in best) / len(best)
+    cy = sum(p[1] for p in best) / len(best)
+    return cx, cy
+
+
+def _focus_gui_on_traffic(
+    view_id: str = "View #0",
+    *,
+    mode: str = "wide",
+) -> bool:
+    """
+    Center the GUI on the densest traffic cluster.
+    mode='close' → block-scale zoom; mode='wide' → multi-block overview.
+    """
+    try:
+        import traci
+    except Exception:
         return False
-    # Prefer densest local cluster (median) so we do not zoom out to the whole city.
-    xs_s = sorted(xs)
-    ys_s = sorted(ys)
-    mid = len(xs_s) // 2
-    cx, cy = xs_s[mid], ys_s[mid]
-    half = max(70.0, pad_m * 0.5)
+    hot = _traffic_hotspot()
+    if hot is None:
+        return False
+    cx, cy = hot
+    # half extents in meters (view width/height ≈ 2*half)
+    if mode == "close":
+        half = 220.0
+    else:
+        half = 560.0
     try:
         traci.gui.setBoundary(
             view_id,
@@ -390,7 +427,7 @@ def _focus_gui_on_traffic(view_id: str = "View #0", *, pad_m: float = 160.0) -> 
 
 
 def _zoom_gui_to_network(cfg_path: Path, view_id: str = "View #0") -> None:
-    """Initial street-block zoom (~25% of network) until traffic appears."""
+    """Initial mid-scale overview (~40% of network) until traffic appears."""
     try:
         import sumolib
         import traci
@@ -408,8 +445,8 @@ def _zoom_gui_to_network(cfg_path: Path, view_id: str = "View #0") -> None:
         xmin, ymin, xmax, ymax = net.getBoundary()
         cx = 0.5 * (xmin + xmax)
         cy = 0.5 * (ymin + ymax)
-        half_w = max(120.0, (xmax - xmin) * 0.125)
-        half_h = max(120.0, (ymax - ymin) * 0.125)
+        half_w = max(250.0, (xmax - xmin) * 0.20)
+        half_h = max(250.0, (ymax - ymin) * 0.20)
         traci.gui.setBoundary(
             view_id,
             cx - half_w,
@@ -680,6 +717,10 @@ def run_simulation(
     every = max(1.0, float(record_every_s))
     next_shot_at = 0.0
     last_progress_t = -1e9
+    # Alternate close ↔ wide every 30 s of sim time, always on densest traffic.
+    camera_cycle_s = 30.0
+    camera_mode = "wide"  # start pulled back so the first frames show context
+    next_camera_switch_at: Optional[float] = None
 
     try:
         end = float(traci.simulation.getEndTime())
@@ -694,6 +735,7 @@ def run_simulation(
 
     def _os_capture(sim_t: float) -> None:
         nonlocal frame_i, next_shot_at, gui_hwnd, capture_failures
+        nonlocal camera_mode, next_camera_switch_at
         if frames_path is None or sim_t + 1e-9 < next_shot_at:
             return
         # Do not capture an empty network: wait until TraCI reports vehicles,
@@ -705,7 +747,12 @@ def run_simulation(
         if n_veh <= 0:
             return
         next_shot_at = sim_t + every
-        focused = _focus_gui_on_traffic()
+        if next_camera_switch_at is None:
+            next_camera_switch_at = sim_t + camera_cycle_s
+        elif sim_t + 1e-9 >= next_camera_switch_at:
+            camera_mode = "close" if camera_mode == "wide" else "wide"
+            next_camera_switch_at = sim_t + camera_cycle_s
+        focused = _focus_gui_on_traffic(mode=camera_mode)
         if not focused:
             capture_failures += 1
             return
