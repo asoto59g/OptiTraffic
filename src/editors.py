@@ -20,6 +20,7 @@ class LaneOverride:
     edge_id: str
     num_lanes: int = 1
     oneway_dual: bool = False  # two lanes same direction
+    reason: str = ""  # e.g. "default_single_lane"
 
 
 @dataclass
@@ -29,6 +30,7 @@ class ParkingConfig:
     corner_clearance_m: float = 5.0
     length_m: float = 40.0
     capacity: int = 8
+    reason: str = ""  # e.g. "default_right_full"
 
 
 @dataclass
@@ -201,6 +203,83 @@ def merge_default_stops(edits: NetworkEdits, suggested: list[StopSign], replace_
     return added
 
 
+def default_street_rules_for_edges(
+    edges_geojson: dict[str, Any],
+    *,
+    corner_clearance_m: float = 5.0,
+    stall_m: float = 5.0,
+) -> tuple[list[LaneOverride], list[ParkingConfig]]:
+    """
+    Default urban street rules for every SUMO edge:
+    - 1 lane (single carriageway in that direction)
+    - Full-length parking on the right (minus corner clearances)
+    """
+    lanes: list[LaneOverride] = []
+    parking: list[ParkingConfig] = []
+    for feat in edges_geojson.get("features", []):
+        props = feat.get("properties") or {}
+        eid = props.get("id")
+        if not eid:
+            continue
+        eid = str(eid)
+        try:
+            length = float(props.get("length") or 50.0)
+        except (TypeError, ValueError):
+            length = 50.0
+        usable = max(10.0, length - 2.0 * float(corner_clearance_m))
+        usable = min(usable, max(10.0, length - float(corner_clearance_m)))
+        cap = max(1, int(usable / max(2.5, float(stall_m))))
+        lanes.append(
+            LaneOverride(
+                edge_id=eid,
+                num_lanes=1,
+                oneway_dual=False,
+                reason="default_single_lane",
+            )
+        )
+        parking.append(
+            ParkingConfig(
+                edge_id=eid,
+                side="right",
+                corner_clearance_m=float(corner_clearance_m),
+                length_m=round(usable, 1),
+                capacity=cap,
+                reason="default_right_full",
+            )
+        )
+    return lanes, parking
+
+
+def merge_default_street_rules(
+    edits: NetworkEdits,
+    lanes: list[LaneOverride],
+    parking: list[ParkingConfig],
+    *,
+    replace_defaults: bool = True,
+) -> tuple[int, int]:
+    """Apply default 1-lane + right-full parking; keep user (non-default) overrides."""
+    if replace_defaults:
+        edits.lane_overrides = [
+            x for x in edits.lane_overrides if not (x.reason or "").startswith("default_")
+        ]
+        edits.parking = [p for p in edits.parking if not (p.reason or "").startswith("default_")]
+    user_lane_edges = {x.edge_id for x in edits.lane_overrides}
+    user_park_edges = {p.edge_id for p in edits.parking}
+    n_lane = 0
+    n_park = 0
+    for lo in lanes:
+        if lo.edge_id in user_lane_edges:
+            continue
+        edits.lane_overrides.append(lo)
+        n_lane += 1
+    for p in parking:
+        if p.edge_id in user_park_edges:
+            continue
+        edits.parking.append(p)
+        n_park += 1
+    return n_lane, n_park
+
+
 @dataclass
 class NetworkEdits:
     tls_default: TlsTiming = field(default_factory=TlsTiming)
@@ -229,8 +308,33 @@ class NetworkEdits:
         edits.tls_default = TlsTiming(**{k: td[k] for k in ("green", "yellow", "red") if k in td})
         for tid, timing in (d.get("tls_overrides") or {}).items():
             edits.tls_overrides[tid] = TlsTiming(**timing)
-        edits.lane_overrides = [LaneOverride(**x) for x in d.get("lane_overrides") or []]
-        edits.parking = [ParkingConfig(**x) for x in d.get("parking") or []]
+        edits.lane_overrides = [
+            LaneOverride(
+                **{
+                    k: x[k]
+                    for k in ("edge_id", "num_lanes", "oneway_dual", "reason")
+                    if k in x
+                }
+            )
+            for x in d.get("lane_overrides") or []
+        ]
+        edits.parking = [
+            ParkingConfig(
+                **{
+                    k: x[k]
+                    for k in (
+                        "edge_id",
+                        "side",
+                        "corner_clearance_m",
+                        "length_m",
+                        "capacity",
+                        "reason",
+                    )
+                    if k in x
+                }
+            )
+            for x in d.get("parking") or []
+        ]
         edits.stops = [StopSign(**{k: x[k] for k in ("edge_id", "junction_id", "reason") if k in x}) for x in d.get("stops") or []]
         # Ensure reason default for legacy saves
         for s in edits.stops:
@@ -491,7 +595,15 @@ def prepare_sim_network(
             netconvert_bin=nconv,
             skip_junction_ids=set(tls_jids),
         )
-        shutil.copy2(step2, net_out)
+
+        step3 = step2
+        if edits.lane_overrides:
+            patch = work / "lanes.patch.xml"
+            write_lane_patch_xml(patch, edits)
+            step3 = work / "lanes.net.xml"
+            apply_lane_patch(step2, patch, step3, nconv)
+
+        shutil.copy2(step3, net_out)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -664,6 +776,7 @@ def write_parking_add(out_path: Path, edits: NetworkEdits, edge_widths: Optional
                 endPos=str(end),
                 roadsideCapacity=str(p.capacity),
                 angle="0" if side == "right" else "180",
+                friendlyPos="true",
             )
     _indent(root)
     out_path.parent.mkdir(parents=True, exist_ok=True)

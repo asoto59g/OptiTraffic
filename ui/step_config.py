@@ -18,7 +18,9 @@ from src.editors import (  # noqa: E402
     TlsPlacement,
     TlsTiming,
     default_stops_ns_at_avenues,
+    default_street_rules_for_edges,
     merge_default_stops,
+    merge_default_street_rules,
     write_all_additionals,
 )
 from src.network_build import (  # noqa: E402
@@ -306,14 +308,26 @@ def step_config() -> None:
                 st.rerun()
         with a3:
             if st.button("✅ Confirmar parqueo", width="stretch", disabled=not eid):
+                length_m = 40.0
+                for feat in edges_gj.get("features", []):
+                    props = feat.get("properties") or {}
+                    if str(props.get("id")) == str(eid):
+                        try:
+                            length_m = float(props.get("length") or 40.0)
+                        except (TypeError, ValueError):
+                            length_m = 40.0
+                        break
+                clearance = 5.0
+                usable = max(10.0, length_m - 2.0 * clearance)
                 edits.parking = [p for p in edits.parking if p.edge_id != eid]
                 edits.parking.append(
                     ParkingConfig(
                         edge_id=eid,
                         side="right",
-                        corner_clearance_m=5.0,
-                        length_m=40.0,
-                        capacity=8,
+                        corner_clearance_m=clearance,
+                        length_m=round(usable, 1),
+                        capacity=max(1, int(usable / 5.0)),
+                        reason="",
                     )
                 )
                 st.session_state.edits = edits
@@ -404,6 +418,12 @@ def step_config() -> None:
         f"(calle N–S × avenida E–O). En la simulación se aplican como `priority_stop` "
         f"(avenidas con prioridad; calles con alto deben detenerse)."
     )
+    n_lane_def = sum(1 for x in edits.lane_overrides if (x.reason or "").startswith("default_"))
+    n_park_def = sum(1 for p in edits.parking if (p.reason or "").startswith("default_"))
+    st.caption(
+        f"Calles: **{n_lane_def}** con 1 carril default · **{n_park_def}** con parqueo "
+        f"derecho lleno (default). Los cambios manuales del tramo no se sobrescriben."
+    )
     if st.button("Reaplicar regla default (calles N-S con alto)"):
         tls_jids = {
             str(t.get("node") or t.get("id") or "")
@@ -418,6 +438,16 @@ def step_config() -> None:
         added = merge_default_stops(edits, suggested, replace_defaults=True)
         st.session_state.edits = edits
         st.success(f"Regla aplicada: {added} altos en calles N-S (cruces con avenida).")
+        st.rerun()
+    if st.button("Reaplicar default: 1 carril + parqueo derecho lleno"):
+        lane_defs, park_defs = default_street_rules_for_edges(edges_gj)
+        n_lane, n_park = merge_default_street_rules(
+            edits, lane_defs, park_defs, replace_defaults=True
+        )
+        st.session_state.edits = edits
+        st.success(
+            f"Default aplicado: {n_lane} edges a 1 carril · {n_park} parqueos derechos llenos."
+        )
         st.rerun()
 
     st.session_state.edits = edits

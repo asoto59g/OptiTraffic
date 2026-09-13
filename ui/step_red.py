@@ -13,7 +13,9 @@ if str(ROOT) not in sys.path:
 from src.editors import (  # noqa: E402
     NetworkEdits,
     default_stops_ns_at_avenues,
+    default_street_rules_for_edges,
     merge_default_stops,
+    merge_default_street_rules,
 )
 from src.network_build import (  # noqa: E402
     build_network,
@@ -132,17 +134,28 @@ def step_red() -> None:
                     )
                     edits: NetworkEdits = st.session_state.edits
                     n_added = merge_default_stops(edits, suggested, replace_defaults=True)
+                    lane_defs, park_defs = default_street_rules_for_edges(gj)
+                    n_lane, n_park = merge_default_street_rules(
+                        edits, lane_defs, park_defs, replace_defaults=True
+                    )
                     st.session_state.edits = edits
                     st.session_state._default_stops_applied = n_added
+                    st.session_state._default_lanes_applied = n_lane
+                    st.session_state._default_parking_applied = n_park
                 except Exception:
                     st.session_state._default_stops_applied = 0
+                    st.session_state._default_lanes_applied = 0
+                    st.session_state._default_parking_applied = 0
                 _bump_map()
             n_def = int(st.session_state.get("_default_stops_applied") or 0)
+            n_lane = int(st.session_state.get("_default_lanes_applied") or 0)
+            n_park = int(st.session_state.get("_default_parking_applied") or 0)
             st.success(
                 f"Red generada: {net} ({len(gj.get('features', []))} edges) · "
                 f"sentido único={stats.get('oneway_edges', '?')} · "
                 f"doble={stats.get('twoway_edges', '?')} · "
-                f"altos default N–S={n_def}"
+                f"altos default N–S={n_def} · "
+                f"1 carril default={n_lane} · parqueo der. lleno={n_park}"
             )
             st.rerun()
         except Exception as e:

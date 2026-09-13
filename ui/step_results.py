@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 from src.scenarios import (  # noqa: E402
     save_scenario,
 )
+from src.simulate import SAFE_RUNS  # noqa: E402
 from ui.common import (  # noqa: E402
     render_study_map,
 )
@@ -139,10 +140,20 @@ def step_results() -> None:
 
     name = st.text_input("Nombre del escenario", value=f"{st.session_state.city}_mvp")
     overwrite = st.checkbox("Sobrescribir si existe el mismo nombre", value=False, key="res_overwrite")
-    if st.button("Guardar escenario (zona + config + resultados)", type="primary"):
+    st.caption(
+        "Al guardar se incluye el **proyecto SUMO completo** (`sumo/optitraffic.sumocfg` + red, "
+        "rutas y additionals) listo para abrir en sumo-gui."
+    )
+    if st.button("Guardar escenario (zona + config + resultados + SUMO)", type="primary"):
         extras = [p for p in (csv_path, gj_path) if p.exists()]
         if video_path and Path(video_path).exists():
             extras.append(Path(video_path))
+        sim_run = Path(run_dir) if run_dir else None
+        if sim_run is None or not (sim_run / "optitraffic.sumocfg").exists():
+            # Prefer the ASCII-safe run used by TraCI/SUMO
+            candidate = SAFE_RUNS / "current"
+            if (candidate / "optitraffic.sumocfg").exists():
+                sim_run = candidate
         folder = save_scenario(
             name,
             st.session_state.area,
@@ -161,8 +172,18 @@ def step_results() -> None:
             },
             extra_files=extras or None,
             overwrite=overwrite,
+            run_dir=sim_run,
         )
         st.session_state.scenario_folder = str(folder)
-        st.success(f"Guardado en {folder}")
-
+        sumo_cfg = folder / "sumo" / "optitraffic.sumocfg"
+        if sumo_cfg.is_file():
+            st.success(
+                f"Guardado en `{folder}` · Abra sumo-gui con `{sumo_cfg}`"
+            )
+        else:
+            st.success(f"Guardado en `{folder}`")
+            st.warning(
+                "No se encontró una corrida SUMO para empaquetar. "
+                "Ejecute de nuevo el paso 5 y vuelva a guardar."
+            )
 

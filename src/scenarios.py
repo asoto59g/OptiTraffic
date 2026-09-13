@@ -20,9 +20,116 @@ log = get_logger("scenarios")
 ROOT = Path(__file__).resolve().parents[1]
 SCENARIOS_DIR = ROOT / "scenarios"
 
+# Files that make a self-contained sumo-gui project (opened via *.sumocfg).
+_SUMO_PROJECT_FILES = (
+    "sim.net.xml",
+    "routes.rou.xml",
+    "routes.rou.alt.xml",
+    "trips.xml",
+    "tls.add.xml",
+    "stops.add.xml",
+    "parking.add.xml",
+    "viewsettings_record.xml",
+    "kpis.json",
+)
+
 
 def _slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "scenario"
+
+
+def package_sumo_project(run_dir: Path, dest_dir: Path) -> Optional[Path]:
+    """
+    Copy the last simulation's SUMO inputs into dest_dir and write a portable
+    optitraffic.sumocfg with *relative* paths (openable in sumo-gui anywhere).
+
+    Returns path to the .sumocfg, or None if there is no usable demand file.
+    """
+    import xml.etree.ElementTree as ET
+
+    run_dir = Path(run_dir)
+    dest_dir = Path(dest_dir)
+    if not run_dir.is_dir():
+        return None
+
+    routes = run_dir / "routes.rou.xml"
+    trips = run_dir / "trips.xml"
+    if not routes.is_file() and not trips.is_file():
+        return None
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for name in _SUMO_PROJECT_FILES:
+        src = run_dir / name
+        if src.is_file():
+            shutil.copy2(src, dest_dir / name)
+
+    # Fallback net name if sim.net.xml missing (older runs)
+    net_name = "sim.net.xml"
+    if not (dest_dir / net_name).is_file():
+        cfg_src = run_dir / "optitraffic.sumocfg"
+        if cfg_src.is_file():
+            try:
+                tree = ET.parse(cfg_src)
+                net_el = tree.find("./input/net-file")
+                if net_el is not None and net_el.get("value"):
+                    src_net = Path(net_el.get("value", ""))
+                    if src_net.is_file():
+                        net_name = src_net.name
+                        shutil.copy2(src_net, dest_dir / net_name)
+            except Exception:
+                log.warning("No se pudo leer net-file del sumocfg de la corrida", exc_info=True)
+        if not (dest_dir / net_name).is_file():
+            for cand in run_dir.glob("*.net.xml"):
+                net_name = cand.name
+                shutil.copy2(cand, dest_dir / net_name)
+                break
+
+    if not (dest_dir / net_name).is_file():
+        log.warning("package_sumo_project: sin red .net.xml en %s", run_dir)
+        return None
+
+    routes_name = "routes.rou.xml" if (dest_dir / "routes.rou.xml").is_file() else "trips.xml"
+    add_names = [
+        n
+        for n in ("tls.add.xml", "stops.add.xml", "parking.add.xml", "viewsettings_record.xml")
+        if (dest_dir / n).is_file()
+    ]
+
+    # Read begin/end from existing cfg when possible
+    begin, end = "0", "3600"
+    cfg_src = run_dir / "optitraffic.sumocfg"
+    if cfg_src.is_file():
+        try:
+            tree = ET.parse(cfg_src)
+            b = tree.find("./time/begin")
+            e = tree.find("./time/end")
+            if b is not None and b.get("value"):
+                begin = b.get("value", begin)
+            if e is not None and e.get("value"):
+                end = e.get("value", end)
+        except Exception:
+            log.debug("No se leyeron begin/end del sumocfg origen", exc_info=True)
+
+    root = ET.Element("configuration")
+    inp = ET.SubElement(root, "input")
+    ET.SubElement(inp, "net-file", value=net_name)
+    ET.SubElement(inp, "route-files", value=routes_name)
+    if add_names:
+        ET.SubElement(inp, "additional-files", value=",".join(add_names))
+    time_el = ET.SubElement(root, "time")
+    ET.SubElement(time_el, "begin", value=str(begin))
+    ET.SubElement(time_el, "end", value=str(end))
+    proc = ET.SubElement(root, "processing")
+    ET.SubElement(proc, "time-to-teleport", value="120")
+    ET.SubElement(proc, "collision.action", value="warn")
+    ET.SubElement(proc, "ignore-junction-blocker", value="0")
+    if (dest_dir / "viewsettings_record.xml").is_file():
+        gui = ET.SubElement(root, "gui_only")
+        ET.SubElement(gui, "gui-settings-file", value="viewsettings_record.xml")
+
+    cfg_out = dest_dir / "optitraffic.sumocfg"
+    ET.ElementTree(root).write(cfg_out, encoding="utf-8", xml_declaration=True)
+    return cfg_out
 
 
 def list_scenarios() -> list[Path]:
@@ -95,12 +202,14 @@ def save_scenario(
     extra_files: Optional[list[Path]] = None,
     overwrite: bool = False,
     flow_gates: Optional[list[dict[str, Any]]] = None,
+    run_dir: Optional[Path] = None,
 ) -> Path:
     """
     Persist zone configuration tied to the study polygon.
 
     Stores: polygon, edits (TLS/parking/stops/lanes), optional net, edges GeoJSON,
-    TLS list, TomTom levels, flow gates, result summary.
+    TLS list, TomTom levels, flow gates, result summary, and (when run_dir is set)
+    a portable sumo/ project for sumo-gui.
     """
     SCENARIOS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -130,6 +239,15 @@ def save_scenario(
             encoding="utf-8",
         )
 
+    sumo_cfg_rel: Optional[str] = None
+    if run_dir is not None:
+        sumo_dir = folder / "sumo"
+        if sumo_dir.exists():
+            shutil.rmtree(sumo_dir, ignore_errors=True)
+        cfg = package_sumo_project(Path(run_dir), sumo_dir)
+        if cfg is not None:
+            sumo_cfg_rel = "sumo/optitraffic.sumocfg"
+
     meta = {
         "name": name,
         "created": datetime.now().isoformat(timespec="seconds"),
@@ -142,6 +260,7 @@ def save_scenario(
         "flow_gates": flow_gates or [],
         "has_edges_geojson": bool(edges_gj) or (folder / "edges.geojson").exists(),
         "has_tls_list": tls_list is not None or (folder / "tls_list.json").exists(),
+        "sumo_project": sumo_cfg_rel,
         "counts": {
             "tls_placements": len(edits.tls_placements),
             "parking": len(edits.parking),
