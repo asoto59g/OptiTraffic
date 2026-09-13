@@ -52,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
             frames_dir=Path(job["frames_dir"]) if job.get("frames_dir") else None,
             video_path=Path(job["video_path"]) if job.get("video_path") else None,
             video_fps=float(job.get("video_fps") or 5),
+            camera_segment_s=float(job.get("camera_segment_s") or 300),
             progress_file=progress_path,
         )
         result_path.write_text(

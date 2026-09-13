@@ -17,6 +17,12 @@ from .traffic_params import CITY_MAX_SPEED_MS, CONGESTION_SPEED_MS, desired_spee
 from .osm_fetch import SAFE_ROOT, path_is_safe, to_safe_path
 from .sumo_env import SumoEnv, detect_sumo, ensure_sumolib_on_path
 from .logging_config import get_logger
+from .video_camera import (
+    DEFAULT_SEGMENT_S,
+    apply_camera_shot,
+    load_net_bounds_from_cfg,
+    plan_camera_shot,
+)
 
 log = get_logger("simulate")
 
@@ -648,6 +654,7 @@ def run_simulation(
     screenshot_size: tuple[int, int] = (1280, 720),
     progress_cb: Optional[Any] = None,
     progress_file: Optional[Path] = None,
+    camera_segment_s: float = DEFAULT_SEGMENT_S,
 ) -> SimResult:
     sumo = sumo or detect_sumo()
     if not sumo.ok or not sumo.sumo_bin:
@@ -750,12 +757,24 @@ def run_simulation(
         gui_pid = _traci_sumo_pid(label)
         time.sleep(0.8)
         gui_hwnd = _find_sumo_gui_hwnd(gui_pid)
-        # Fit view to full network so cars are not off-camera.
+        # Fit view to full network tightly (guion toma 1).
         try:
             traci.simulationStep()
         except traci.TraCIException:
             pass
         _zoom_gui_to_network(cfg_safe)
+        try:
+            from .video_camera import overview_boundary
+
+            nb0 = load_net_bounds_from_cfg(cfg_safe)
+            if nb0 is not None:
+                xmin, ymin, xmax, ymax = overview_boundary(nb0)
+                try:
+                    traci.gui.setBoundary("View #0", xmin, ymin, xmax, ymax)
+                except Exception:
+                    pass
+        except Exception:
+            log.debug("overview inicial falló", exc_info=True)
         try:
             traci.simulationStep()
         except traci.TraCIException:
@@ -796,10 +815,9 @@ def run_simulation(
     every = max(1.0, float(record_every_s))
     next_shot_at = 0.0
     last_progress_t = -1e9
-    # Alternate close ↔ wide every 30 s of sim time, always on densest traffic.
-    camera_cycle_s = 30.0
-    camera_mode = "wide"  # start pulled back so the first frames show context
-    next_camera_switch_at: Optional[float] = None
+    camera_segment = max(30.0, float(camera_segment_s))
+    net_bounds = load_net_bounds_from_cfg(cfg_safe) if use_gui else None
+    last_camera_phase = ""
 
     try:
         end = float(traci.simulation.getEndTime())
@@ -814,29 +832,42 @@ def run_simulation(
 
     def _os_capture(sim_t: float) -> None:
         nonlocal frame_i, next_shot_at, gui_hwnd, capture_failures
-        nonlocal camera_mode, next_camera_switch_at
+        nonlocal last_camera_phase
         if frames_path is None or sim_t + 1e-9 < next_shot_at:
             return
-        # Do not capture an empty network: wait until TraCI reports vehicles,
-        # then aim the camera at them and give the GUI time to paint.
         try:
             n_veh = len(traci.vehicle.getIDList())
         except Exception:
             n_veh = 0
-        if n_veh <= 0:
-            return
-        next_shot_at = sim_t + every
-        if next_camera_switch_at is None:
-            next_camera_switch_at = sim_t + camera_cycle_s
-        elif sim_t + 1e-9 >= next_camera_switch_at:
-            camera_mode = "close" if camera_mode == "wide" else "wide"
-            next_camera_switch_at = sim_t + camera_cycle_s
-        focused = _focus_gui_on_traffic(mode=camera_mode)
-        if not focused:
-            capture_failures += 1
-            return
+
+        hot = _traffic_hotspot() if n_veh > 0 else None
+        if net_bounds is None:
+            # Fallback: old traffic focus if we cannot read the net bbox
+            if n_veh <= 0:
+                return
+            next_shot_at = sim_t + every
+            focused = _focus_gui_on_traffic(mode="close" if n_veh > 40 else "wide")
+            if not focused:
+                capture_failures += 1
+                return
+        else:
+            shot = plan_camera_shot(
+                sim_t,
+                net_bounds,
+                hotspot=hot,
+                segment_s=camera_segment,
+            )
+            if shot.require_vehicles and n_veh <= 0:
+                return
+            next_shot_at = sim_t + every
+            if shot.phase != last_camera_phase:
+                last_camera_phase = shot.phase
+                log.info("Video cámara · fase=%s t=%.0fs", shot.phase, sim_t)
+            if not apply_camera_shot(shot):
+                capture_failures += 1
+                return
+
         # Extra step + pause so sumo-gui redraws vehicles in the new viewport
-        # (otherwise OS grabs show roads without cars while KPIs are fine).
         try:
             traci.simulationStep()
         except traci.TraCIException:
@@ -852,8 +883,8 @@ def run_simulation(
             capture_failures += 1
             gui_hwnd = None
             return
-        shot = frames_path / f"frame_{frame_i:06d}.png"
-        if _capture_hwnd_png(gui_hwnd, shot):
+        shot_path = frames_path / f"frame_{frame_i:06d}.png"
+        if _capture_hwnd_png(gui_hwnd, shot_path):
             frame_i += 1
         else:
             capture_failures += 1

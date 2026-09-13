@@ -665,10 +665,13 @@ def step_sim() -> None:
     video_fps = 5.0
     if record_video and gui_ok:
         st.warning(
-            "La grabación espera a que haya **vehículos**, enfoca el **punto con más tráfico** "
-            "y alterna acercamiento/alejamiento cada **30 s** de simulación. "
-            "Deje sumo-gui visible; el MP4 se arma al final. "
-            "Con grabación la simulación es más lenta (~100 ms/paso)."
+            "Guion de cámara (300 s de simulación por toma): "
+            "**1)** polígono completo (encuadre ajustado) → "
+            "**2)** zoom hasta distinguir vehículos → "
+            "**3)** espiral a esa escala sobre todo el polígono → "
+            "**4)** misma espiral más cerca del suelo → "
+            "**5)** vuelve a (2) y repite. "
+            "Deje sumo-gui visible; el MP4 se arma al final."
         )
         rc1, rc2 = st.columns(2)
         with rc1:
@@ -677,10 +680,10 @@ def step_sim() -> None:
                     "Intervalo de captura (s sim)",
                     5,
                     60,
-                    10,
+                    5,
                     5,
                     key="record_every_s",
-                    help="5–10 s suele bastar para un video corto y legible.",
+                    help="5 s da espirales más fluidas (~60 frames por toma de 300 s).",
                 )
             )
         with rc2:
@@ -695,11 +698,25 @@ def step_sim() -> None:
                     help="Cuadros por segundo al ensamblar el video.",
                 )
             )
+        camera_segment_s = float(
+            st.number_input(
+                "Duración de cada toma del guion (s sim)",
+                min_value=60,
+                max_value=900,
+                value=300,
+                step=30,
+                key="camera_segment_s",
+                help="Por defecto 300 s: overview, zoom, espiral media, espiral detalle.",
+            )
+        )
         n_est = max(1, int(duration / record_every))
+        n_segments = max(1, int(duration / camera_segment_s))
         st.caption(
-            f"≈ {n_est} capturas · ventana GUI 1280×720 · "
+            f"≈ {n_est} capturas · ~{n_segments} tomas de guion · ventana GUI 1280×720 · "
             f"{'MP4 al final' if ff_ok else 'solo PNG (sin ffmpeg)'}"
         )
+    else:
+        camera_segment_s = 300.0
 
     base_rate = st.slider(
         f"Densidad base (solo si no hay puertas) — {dens.label}",
@@ -874,6 +891,7 @@ def step_sim() -> None:
                 "frames_dir": str(run_dir / "frames"),
                 "video_path": str(run_dir / "simulation.mp4"),
                 "video_fps": float(video_fps),
+                "camera_segment_s": float(camera_segment_s),
                 "progress_file": str(progress_path),
                 "result_file": str(result_path),
                 "end": float(duration),
