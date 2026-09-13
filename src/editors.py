@@ -91,20 +91,72 @@ def edge_bearing_deg(coords: list) -> Optional[float]:
     return math.degrees(math.atan2(lon1 - lon0, lat1 - lat0)) % 360.0
 
 
+def flow_dir_from_bearing(bearing_deg: Optional[float]) -> str:
+    """
+    Cardinal flow of this SUMO edge (direction of travel along the geometry).
+    Returns one of: 'OE' (O→E), 'EO' (E→O), 'NS' (N→S), 'SN' (S→N), or ''.
+    """
+    if bearing_deg is None:
+        return ""
+    b = float(bearing_deg) % 360.0
+    if 45.0 <= b < 135.0:
+        return "OE"  # west → east
+    if 135.0 <= b < 225.0:
+        return "NS"  # north → south
+    if 225.0 <= b < 315.0:
+        return "EO"  # east → west
+    return "SN"  # south → north
+
+
+def flow_dir_label(code: str, role: str = "") -> str:
+    """Human label, optionally prefixed with avenida/calle."""
+    mapping = {
+        "OE": "O→E",
+        "EO": "E→O",
+        "NS": "N→S",
+        "SN": "S→N",
+    }
+    arrow = mapping.get((code or "").upper(), "")
+    if not arrow:
+        return ""
+    role_l = (role or "").lower()
+    if role_l == "avenida":
+        return f"Avenida {arrow}"
+    if role_l == "calle":
+        return f"Calle {arrow}"
+    return arrow
+
+
 def annotate_road_roles(edges_geojson: dict[str, Any]) -> dict[str, Any]:
-    """Add properties: bearing, road_role (avenida/calle/other), axis (EW/NS)."""
+    """Add properties: bearing, road_role, axis (EW/NS), flow_dir (OE/EO/NS/SN)."""
     for feat in edges_geojson.get("features", []):
         props = feat.setdefault("properties", {})
+        # Keep user override of flow_dir if marked
+        user_flow = str(props.get("flow_dir_user") or "")
         coords = (feat.get("geometry") or {}).get("coordinates") or []
         bearing = edge_bearing_deg(coords)
         role = classify_road_role(str(props.get("name") or ""), bearing)
         props["bearing"] = None if bearing is None else round(float(bearing), 1)
-        props["road_role"] = role
         if bearing is None:
             props["axis"] = ""
+            auto_flow = ""
         else:
             b = abs(float(bearing)) % 180.0
             props["axis"] = "EW" if 45.0 <= b <= 135.0 else "NS"
+            auto_flow = flow_dir_from_bearing(bearing)
+        if user_flow in ("OE", "EO", "NS", "SN"):
+            props["flow_dir"] = user_flow
+            # Override aligns Costa Rica axis with chosen cardinal flow
+            if user_flow in ("OE", "EO"):
+                role = "avenida"
+                props["axis"] = "EW"
+            else:
+                role = "calle"
+                props["axis"] = "NS"
+        else:
+            props["flow_dir"] = auto_flow
+        props["road_role"] = role
+        props["flow_dir_label"] = flow_dir_label(str(props.get("flow_dir") or ""), role)
     return edges_geojson
 
 

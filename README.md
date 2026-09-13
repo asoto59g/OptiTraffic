@@ -60,10 +60,10 @@ streamlit run app.py
 |------|----------|
 | **1. Zona** | Ciudad + **país en lista** (Geofabrik), geocodificación, rectángulo/dibujo/GeoJSON (máx. ~25 km²). Preview del extracto. |
 | **2. Red OSM→SUMO** | Overpass (rápido) o Geofabrik (país, **tope 500 MB**) → recorte → `netconvert` → mapa de edges. |
-| **3. Configuración** | Clic en **cruces** (semáforos) o **calles** (alto/parqueo/carriles). Guardar/cargar config ligada al polígono. |
+| **3. Configuración** | Clic en **cruces** (semáforos) o **calles** (alto/parqueo/carriles). En **opciones extra**: dirección de flujo (avenida O→E/E→O, calle N→S/S→N). Guardar/cargar config ligada al polígono. |
 | **4. TomTom** | Flow tiles o **calibración sintética** (CR sin cobertura TomTom Flow). |
-| **5. Simulación** | **Entradas/salidas** de flujo + warmup; demanda OD; duración larga; KPIs; opcional **Grabar video (sumo-gui)** → PNG + MP4 (ffmpeg). |
-| **6. Resultados** | Mapa de congestión, CSV/GeoJSON, guardar escenario completo. |
+| **5. Simulación** | **Entradas/salidas** de flujo + warmup; demanda OD; duración larga; KPIs; fondo OSM/satélite en sumo-gui; opcional **Grabar video (sumo-gui)** → PNG + MP4 (ffmpeg). |
+| **6. Resultados** | Mapa de congestión, CSV/GeoJSON, guardar escenario portable (`sumo/`). |
 
 ---
 
@@ -90,6 +90,8 @@ En hora pico, TomTom **reduce la velocidad permitida del tramo** (no solo sube l
 
 **Sentidos OSM:** se respetan `oneway` de OpenStreetMap. El mapa muestra un sentido (azul oscuro + flechas) vs doble sentido. Si OSM no trae `oneway=yes`, SUMO modela doble sentido.
 
+**Avenidas / calles (Costa Rica):** por bearing del edge se clasifica eje E–O (avenida) o N–S (calle) y la dirección de circulación de ese edge SUMO: **O→E**, **E→O**, **N→S** o **S→N**. En el paso 3 (opciones extra) se muestra el valor detectado y se puede corregir manualmente (`flow_dir` / `flow_dir_user` en las propiedades del edge).
+
 ---
 
 ## Datos OSM (Overpass / Geofabrik)
@@ -106,6 +108,7 @@ En hora pico, TomTom **reduce la velocidad permitida del tramo** (no solo sube l
 Al terminar la configuración (paso 3) o en resultados (paso 6):
 
 - Se guarda **polígono + semáforos/altos/parqueos/carriles + red + edges** en `scenarios/<nombre>_fecha/`.
+- En paso 6 se empaqueta un proyecto SUMO portable en `sumo/` (`optitraffic.sumocfg` relativo, rutas, red, KPIs; fondo OSM/satélite si se generó).
 - Se puede **sobrescribir** por nombre.
 - Carga desde el paso 3 (configs del mismo polígono, IoU ≥ 85%) o desde la **barra lateral**.
 - Los escenarios locales no se suben a git (`scenarios/*/` en `.gitignore`).
@@ -121,14 +124,15 @@ src/
   area.py              # Zona, Nominatim (caché + rate-limit), GeoJSON
   osm_fetch.py         # Overpass / Geofabrik (+ tope PBF, index-v1)
   network_build.py     # netconvert, edges GeoJSON, tope 40 km/h
-  editors.py           # TLS / parking / stops / lanes → XML SUMO
+  editors.py           # TLS / parking / stops / lanes / roles avenida-calle + flow_dir
   tomtom.py            # Flow tiles + STRtree match + sintético
   flow_gates.py        # Entradas/salidas de demanda OD
   demand.py            # Demanda + escenarios de densidad
   traffic_params.py    # 40 km/h, 5 m, capacidad espacial
   simulate.py          # TraCI, KPIs, warmup
+  sumo_background.py   # Teselas OSM / satélite para sumo-gui
   viz.py               # Folium
-  scenarios.py         # Guardar / cargar config
+  scenarios.py         # Guardar / cargar config (+ paquete sumo/)
   wizard_state.py      # Estado tipado del wizard
   logging_config.py    # Logging central
 tests/                 # pytest (sin SUMO/TomTom por defecto)
@@ -160,6 +164,9 @@ ruff check src ui tests app.py scripts
 
 ## Changelog reciente (post-MVP inicial)
 
+- Dirección de flujo en opciones extra (paso 3): avenida O→E/E→O y calle N→S/S→N, con override manual.
+- Fondo OSM/satélite en sumo-gui; proyectos SUMO portables al guardar; default 1 carril + parqueo derecho.
+- TLS/altos reales en la red; demanda ordenada por `depart`; preload con puertas de flujo.
 - Hardening: `ui/` modular, pytest + GitHub Actions, LICENSE MIT, logging.
 - Nominatim con caché/rate-limit; Geofabrik vía index + tope PBF 500 MB; país en selectbox.
 - Puertas entrada/salida + simulación larga con warmup; TomTom sintético si no hay cobertura (CR).

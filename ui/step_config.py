@@ -17,8 +17,11 @@ from src.editors import (  # noqa: E402
     StopSign,
     TlsPlacement,
     TlsTiming,
+    annotate_road_roles,
     default_stops_ns_at_avenues,
     default_street_rules_for_edges,
+    flow_dir_from_bearing,
+    flow_dir_label,
     merge_default_stops,
     merge_default_street_rules,
     write_all_additionals,
@@ -86,6 +89,13 @@ def step_config() -> None:
         edges_gj = annotate_edge_directions(edges_gj)
         st.session_state.edges_gj = edges_gj
         st.session_state._junctions_key = None  # refresh slim map cache
+
+    # Ensure avenida/calle + flow direction (O→E / E→O / N→S / S→N) are present
+    sample_props = ((edges_gj.get("features") or [{}])[0].get("properties") or {})
+    if edges_gj and "flow_dir" not in sample_props:
+        edges_gj = annotate_road_roles(edges_gj)
+        st.session_state.edges_gj = edges_gj
+        st.session_state._junctions_key = None
 
     junctions_key = (
         f"junc_{len(edges_gj.get('features', []))}_{st.session_state.get('map_nonce', 0)}"
@@ -371,6 +381,60 @@ def step_config() -> None:
         st.caption("Primero confirme un semáforo con el botón de arriba.")
 
     st.subheader("3) Opciones extra del tramo (opcional)")
+    # Dirección de flujo del edge seleccionado (avenida O↔E / calle N↔S)
+    sel_props: dict = {}
+    if eid:
+        for feat in edges_gj.get("features", []):
+            props = feat.get("properties") or {}
+            if str(props.get("id")) == str(eid):
+                sel_props = props
+                break
+        if not sel_props.get("flow_dir"):
+            annotate_road_roles(edges_gj)
+            st.session_state.edges_gj = edges_gj
+            for feat in edges_gj.get("features", []):
+                props = feat.get("properties") or {}
+                if str(props.get("id")) == str(eid):
+                    sel_props = props
+                    break
+
+    role = str(sel_props.get("road_role") or "")
+    auto_code = str(sel_props.get("flow_dir") or "")
+    if not auto_code and sel_props.get("bearing") is not None:
+        auto_code = flow_dir_from_bearing(sel_props.get("bearing"))
+    auto_label = flow_dir_label(auto_code, role) or "n/d"
+    if eid:
+        st.info(
+            f"Tramo `{eid}` · rol **{role or 'other'}** · flujo detectado **{auto_label}** "
+            f"(bearing {sel_props.get('bearing', '?')}° · sentido OSM "
+            f"**{sel_props.get('sentido') or ('unico' if sel_props.get('oneway') else 'doble')}**)"
+        )
+
+    flow_options = [
+        ("auto", f"Automático ({auto_label})"),
+        ("OE", "Avenida / eje O→E (oeste→este)"),
+        ("EO", "Avenida / eje E→O (este→oeste)"),
+        ("NS", "Calle / eje N→S (norte→sur)"),
+        ("SN", "Calle / eje S→N (sur→norte)"),
+    ]
+    # Index from current user override or auto
+    cur_user = str(sel_props.get("flow_dir_user") or "auto")
+    if cur_user not in ("auto", "OE", "EO", "NS", "SN"):
+        cur_user = "auto"
+    flow_choice = st.selectbox(
+        "Dirección del flujo (este edge SUMO)",
+        options=[c for c, _ in flow_options],
+        format_func=lambda c: dict(flow_options)[c],
+        index=[c for c, _ in flow_options].index(cur_user),
+        key=f"flow_dir_choice_{eid or 'none'}",
+        disabled=not eid,
+        help=(
+            "En Costa Rica: avenidas ≈ este–oeste; calles ≈ norte–sur. "
+            "El valor es el sentido de circulación de ESTE edge (en doble sentido "
+            "el edge contrario lleva la dirección opuesta)."
+        ),
+    )
+
     dual = st.checkbox(
         "2 carriles en el MISMO sentido OSM (no abre el sentido contrario)",
         value=False,
@@ -381,7 +445,33 @@ def step_config() -> None:
     plen = st.number_input("Longitud zona parqueo (m)", 10.0, 200.0, 40.0)
     cap = st.number_input("Capacidad parqueo", 1, 50, 8)
 
-    x1, x2 = st.columns(2)
+    x0, x1, x2 = st.columns(3)
+    with x0:
+        if st.button("Aplicar dirección de flujo", width="stretch", disabled=not eid):
+            for feat in edges_gj.get("features", []):
+                props = feat.setdefault("properties", {})
+                if str(props.get("id")) != str(eid):
+                    continue
+                if flow_choice == "auto":
+                    props.pop("flow_dir_user", None)
+                else:
+                    props["flow_dir_user"] = flow_choice
+                break
+            annotate_road_roles(edges_gj)
+            applied = next(
+                (
+                    (f.get("properties") or {})
+                    for f in edges_gj.get("features", [])
+                    if str((f.get("properties") or {}).get("id")) == str(eid)
+                ),
+                {},
+            )
+            st.session_state.edges_gj = edges_gj
+            st.session_state._junctions_key = None
+            st.success(
+                f"Flujo del tramo: {applied.get('flow_dir_label') or applied.get('flow_dir') or 'n/d'}"
+            )
+            st.rerun()
     with x1:
         if st.button("Aplicar carriles al tramo", width="stretch", disabled=not eid):
             edits.lane_overrides = [x for x in edits.lane_overrides if x.edge_id != eid]
