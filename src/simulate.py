@@ -50,6 +50,48 @@ class SimResult:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SimResult":
+        edges_raw = data.get("edges") or {}
+        edges: dict[str, EdgeKPI] = {}
+        for eid, ev in edges_raw.items():
+            if isinstance(ev, EdgeKPI):
+                edges[str(eid)] = ev
+            elif isinstance(ev, dict):
+                edges[str(eid)] = EdgeKPI(**ev)
+        return cls(
+            duration_s=int(data.get("duration_s") or 0),
+            vehicle_steps=int(data.get("vehicle_steps") or 0),
+            total_waiting=float(data.get("total_waiting") or 0.0),
+            mean_speed=float(data.get("mean_speed") or 0.0),
+            pct_edges_congested=float(data.get("pct_edges_congested") or 0.0),
+            edges=edges,
+            tomtom_correlation=data.get("tomtom_correlation"),
+            video_path=data.get("video_path"),
+            frames_dir=data.get("frames_dir"),
+            frames_count=int(data.get("frames_count") or 0),
+        )
+
+
+def write_sim_progress(path: Path, **fields: Any) -> None:
+    """Atomic-ish progress JSON for background TraCI jobs (Streamlit polls this)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"updated_at": time.time(), **fields}
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def read_sim_progress(path: Path) -> Optional[dict[str, Any]]:
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
 
 def write_sumocfg(
     cfg_path: Path,
@@ -507,13 +549,17 @@ def _capture_hwnd_png(hwnd: int, dest: Path) -> bool:
 
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    # Raise window so the grab matches the live OpenGL view the user sees.
-    try:
-        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-        user32.SetForegroundWindow(hwnd)
-    except Exception:
-        pass
-    time.sleep(0.05)
+    # Raise window occasionally so grabs match the live OpenGL view.
+    # Avoid every-frame SetForegroundWindow — steals focus and feels like
+    # "moving the mouse closed SUMO" when the user interacts elsewhere.
+    if getattr(_capture_hwnd_png, "_raise_i", 0) % 4 == 0:
+        try:
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        time.sleep(0.05)
+    _capture_hwnd_png._raise_i = getattr(_capture_hwnd_png, "_raise_i", 0) + 1  # type: ignore[attr-defined]
 
     # Prefer screen grab: PrintWindow often omits / flattens OpenGL vehicles.
     try:
@@ -601,6 +647,7 @@ def run_simulation(
     video_fps: float = 5.0,
     screenshot_size: tuple[int, int] = (1280, 720),
     progress_cb: Optional[Any] = None,
+    progress_file: Optional[Path] = None,
 ) -> SimResult:
     sumo = sumo or detect_sumo()
     if not sumo.ok or not sumo.sumo_bin:
@@ -826,12 +873,26 @@ def run_simulation(
                 except Exception:
                     pass
 
-            if progress_cb is not None and (t - last_progress_t) >= 5.0:
-                last_progress_t = t
-                try:
-                    progress_cb(t, end, frame_i)
-                except Exception:
-                    pass
+            if progress_cb is not None or progress_file is not None:
+                if (t - last_progress_t) >= 5.0:
+                    last_progress_t = t
+                    if progress_file is not None:
+                        try:
+                            write_sim_progress(
+                                Path(progress_file),
+                                status="running",
+                                t=float(t),
+                                end=float(end),
+                                frames=int(frame_i),
+                                vehicle_steps=int(vehicle_steps),
+                            )
+                        except Exception:
+                            log.debug("write_sim_progress falló", exc_info=True)
+                    if progress_cb is not None:
+                        try:
+                            progress_cb(t, end, frame_i)
+                        except Exception:
+                            pass
 
             if t < warmup:
                 continue
