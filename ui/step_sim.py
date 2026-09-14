@@ -656,22 +656,40 @@ def step_sim() -> None:
         key="record_video",
         disabled=not gui_ok,
         help=(
-            "Abre sumo-gui, captura pantallas cada N segundos de simulación y "
-            "arma un MP4 con ffmpeg. Más lento que sumo headless. "
-            "No minimice la ventana de SUMO mientras graba."
+            "Abre sumo-gui y captura frames (TraCI). Puede minimizar la ventana; "
+            "si la cierra, TraCI se corta y la simulación termina."
         ),
     )
     record_every = 10.0
     video_fps = 5.0
+    video_capture = "traci"
     if record_video and gui_ok:
+        st.info(
+            "El video **requiere sumo-gui** (SUMO no renderiza sin GUI). "
+            "Por defecto se graba en **segundo plano** con TraCI: puede **minimizar** "
+            "la ventana y seguir usando el PC. **No cierre** sumo-gui o el proceso se detiene."
+        )
         st.warning(
-            "Guion de cámara (300 s de simulación por toma): "
-            "**1)** polígono completo (encuadre ajustado) → "
-            "**2)** zoom hasta distinguir vehículos → "
-            "**3)** espiral a esa escala sobre todo el polígono → "
-            "**4)** misma espiral más cerca del suelo → "
-            "**5)** vuelve a (2) y repite. "
-            "Deje sumo-gui visible; el MP4 se arma al final."
+            "Guion de cámara (**200 s** de simulación por toma): "
+            "**1)** vista general **2×2 km** → "
+            "**2)** acercamiento **400×400 m** (tráfico) → "
+            "**3–4)** espirales **400×400 m** sobre todo el polígono → "
+            "**5)** vuelve a (2)."
+        )
+        video_capture = st.radio(
+            "Modo de captura",
+            options=["traci", "screen"],
+            format_func=lambda k: {
+                "traci": "Segundo plano (TraCI, recomendado)",
+                "screen": "Captura de pantalla (ventana visible)",
+            }[k],
+            horizontal=True,
+            index=0,
+            key="video_capture_mode",
+            help=(
+                "TraCI escribe PNG sin traer sumo-gui al frente. "
+                "Pantalla = ImageGrab (útil si TraCI falla en su PC)."
+            ),
         )
         rc1, rc2 = st.columns(2)
         with rc1:
@@ -683,7 +701,7 @@ def step_sim() -> None:
                     5,
                     5,
                     key="record_every_s",
-                    help="5 s da espirales más fluidas (~60 frames por toma de 300 s).",
+                    help="5 s da espirales más fluidas (~40 frames por toma de 200 s).",
                 )
             )
         with rc2:
@@ -703,10 +721,10 @@ def step_sim() -> None:
                 "Duración de cada toma del guion (s sim)",
                 min_value=60,
                 max_value=900,
-                value=300,
-                step=30,
+                value=200,
+                step=20,
                 key="camera_segment_s",
-                help="Por defecto 300 s: overview, zoom, espiral media, espiral detalle.",
+                help="Por defecto 200 s: overview 2×2 km, zoom/espirales 400×400 m.",
             )
         )
         n_est = max(1, int(duration / record_every))
@@ -716,7 +734,7 @@ def step_sim() -> None:
             f"{'MP4 al final' if ff_ok else 'solo PNG (sin ffmpeg)'}"
         )
     else:
-        camera_segment_s = 300.0
+        camera_segment_s = 200.0
 
     base_rate = st.slider(
         f"Densidad base (solo si no hay puertas) — {dens.label}",
@@ -892,6 +910,7 @@ def step_sim() -> None:
                 "video_path": str(run_dir / "simulation.mp4"),
                 "video_fps": float(video_fps),
                 "camera_segment_s": float(camera_segment_s),
+                "video_capture": str(video_capture),
                 "progress_file": str(progress_path),
                 "result_file": str(result_path),
                 "end": float(duration),

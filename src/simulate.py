@@ -525,8 +525,74 @@ def _zoom_gui_to_network(cfg_path: Path, view_id: str = "View #0") -> None:
         return
 
 
+def _minimize_sumo_gui(hwnd: Optional[int]) -> None:
+    """Minimize sumo-gui without activating it (background recording)."""
+    if sys.platform != "win32" or not hwnd:
+        return
+    try:
+        import ctypes
+
+        # SW_SHOWMINNOACTIVE = 7
+        ctypes.windll.user32.ShowWindow(int(hwnd), 7)
+    except Exception:
+        log.debug("No se pudo minimizar sumo-gui", exc_info=True)
+
+
+def _traci_screenshot(
+    dest: Path,
+    *,
+    width: int = 1280,
+    height: int = 720,
+    view_id: str = "View #0",
+) -> bool:
+    """
+    Ask SUMO to write a screenshot on the *next* simulationStep.
+    Works without bringing the window to the foreground (unlike OS ImageGrab).
+    """
+    try:
+        import traci
+    except Exception:
+        return False
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.is_file():
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+    out = dest if path_is_safe(dest) else to_safe_path(dest)
+    if out != dest and out.is_file():
+        try:
+            out.unlink()
+        except OSError:
+            pass
+    try:
+        traci.gui.screenshot(view_id, str(out).replace("\\", "/"), int(width), int(height))
+        return True
+    except Exception:
+        log.debug("traci.gui.screenshot falló", exc_info=True)
+        return False
+
+
+def _wait_screenshot_file(path: Path, timeout_s: float = 2.5) -> bool:
+    """Poll until TraCI-written PNG exists and looks non-empty."""
+    path = Path(path)
+    deadline = time.time() + max(0.2, float(timeout_s))
+    while time.time() < deadline:
+        try:
+            if path.is_file() and path.stat().st_size > 1000:
+                return True
+        except OSError:
+            pass
+        time.sleep(0.05)
+    try:
+        return path.is_file() and path.stat().st_size > 1000
+    except OSError:
+        return False
+
+
 def _capture_hwnd_png(hwnd: int, dest: Path) -> bool:
-    """Grab what is on-screen in sumo-gui (ImageGrab first — matches what the eye sees)."""
+    """Grab what is on-screen in sumo-gui (ImageGrab — fallback if TraCI screenshot fails)."""
     if sys.platform != "win32" or not hwnd:
         return False
     import ctypes
@@ -655,6 +721,7 @@ def run_simulation(
     progress_cb: Optional[Any] = None,
     progress_file: Optional[Path] = None,
     camera_segment_s: float = DEFAULT_SEGMENT_S,
+    video_capture: str = "traci",
 ) -> SimResult:
     sumo = sumo or detect_sumo()
     if not sumo.ok or not sumo.sumo_bin:
@@ -678,8 +745,13 @@ def run_simulation(
     else:
         bin_path = sumo.sumo_bin
 
-    # SUMO 1.27 + Windows: traci.gui.screenshot often freezes simulationStep.
-    # Open GUI for display; capture frames with OS window grab instead.
+    # SUMO cannot render frames with headless `sumo` — sumo-gui is required.
+    # Default capture uses TraCI screenshots (works minimized / in background).
+    # Optional "screen" mode grabs the OS window (needs the GUI visible).
+    capture_mode = (video_capture or "traci").strip().lower()
+    if capture_mode not in ("traci", "screen"):
+        capture_mode = "traci"
+    gui_delay_ms = "1" if capture_mode == "traci" else "100"
     cmd = [
         str(bin_path),
         "-c",
@@ -704,7 +776,7 @@ def run_simulation(
             gui_settings = write_gui_viewsettings(
                 settings_dir / "viewsettings_record.xml",
                 decals_xml=bg_decals if bg_decals.is_file() else None,
-                delay_ms=100,
+                delay_ms=int(gui_delay_ms),
             )
         except Exception:
             log.warning("No se pudo combinar fondo con viewsettings de grabación", exc_info=True)
@@ -714,7 +786,7 @@ def run_simulation(
                 "--gui-settings-file",
                 str(gui_settings),
                 "--delay",
-                "100",
+                gui_delay_ms,
                 "--window-size",
                 f"{int(screenshot_size[0])},{int(screenshot_size[1])}",
             ]
@@ -781,6 +853,10 @@ def run_simulation(
             pass
         # Re-resolve HWND after window is fully up.
         gui_hwnd = _find_sumo_gui_hwnd(gui_pid) or gui_hwnd
+        if capture_mode == "traci":
+            # Background recording: keep process alive, but don't occupy the desktop.
+            _minimize_sumo_gui(gui_hwnd)
+            log.info("Video: captura TraCI en segundo plano (sumo-gui minimizado)")
 
     if edge_levels:
         for eid, level in edge_levels.items():
@@ -842,7 +918,6 @@ def run_simulation(
 
         hot = _traffic_hotspot() if n_veh > 0 else None
         if net_bounds is None:
-            # Fallback: old traffic focus if we cannot read the net bbox
             if n_veh <= 0:
                 return
             next_shot_at = sim_t + every
@@ -867,12 +942,38 @@ def run_simulation(
                 capture_failures += 1
                 return
 
-        # Extra step + pause so sumo-gui redraws vehicles in the new viewport
+        shot_path = frames_path / f"frame_{frame_i:06d}.png"
+        out_path = shot_path if path_is_safe(shot_path) else to_safe_path(shot_path)
+
+        # Prefer TraCI screenshots — no need to watch / focus the window.
+        used_traci = False
+        if capture_mode == "traci":
+            used_traci = _traci_screenshot(
+                out_path,
+                width=int(screenshot_size[0]),
+                height=int(screenshot_size[1]),
+            )
+            try:
+                traci.simulationStep()
+            except traci.TraCIException:
+                pass
+            if used_traci and _wait_screenshot_file(out_path, timeout_s=2.0):
+                if out_path != shot_path:
+                    try:
+                        shutil.copy2(out_path, shot_path)
+                    except OSError:
+                        pass
+                frame_i += 1
+                return
+            # TraCI screenshot failed (known freeze/quirk on some Windows builds).
+            log.debug("TraCI screenshot no produjo archivo; fallback a captura de pantalla")
+
+        # Fallback / screen mode: OS grab (needs a visible GUI).
         try:
             traci.simulationStep()
         except traci.TraCIException:
             pass
-        time.sleep(0.18)
+        time.sleep(0.12)
         if gui_hwnd is None:
             gui_hwnd = _find_sumo_gui_hwnd(gui_pid)
         if not gui_hwnd:
@@ -883,7 +984,6 @@ def run_simulation(
             capture_failures += 1
             gui_hwnd = None
             return
-        shot_path = frames_path / f"frame_{frame_i:06d}.png"
         if _capture_hwnd_png(gui_hwnd, shot_path):
             frame_i += 1
         else:

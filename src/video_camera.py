@@ -1,11 +1,11 @@
 """Scripted sumo-gui camera for OptiTraffic video recording.
 
-Guion (cada toma = ``segment_s`` segundos de simulación, default 300):
+Guion (cada toma = ``segment_s`` segundos de simulación, default 200):
 
-1. Overview — polígono/red completo, lo más cerca posible (encuadre ajustado).
-2. Vehicle zoom — acercamiento hasta distinguir vehículos (hotspot de tráfico).
-3. Spiral mid — misma escala que (2), recorrido en espiral sobre todo el polígono.
-4. Spiral detail — misma espiral más baja (menor área, más detalle).
+1. Overview — vista general fija **2×2 km** centrada en el polígono/red.
+2. Vehicle zoom — acercamiento **400×400 m** al hotspot de tráfico.
+3. Spiral mid — recorrido en espiral **400×400 m** sobre todo el polígono.
+4. Spiral detail — segunda pasada en espiral **400×400 m** (más vueltas / cobertura).
 5. Volver a (2) y repetir el ciclo 2→3→4.
 """
 
@@ -17,11 +17,21 @@ from typing import Literal, Optional, Tuple
 
 PhaseName = Literal["overview", "vehicle_zoom", "spiral_mid", "spiral_detail"]
 
-DEFAULT_SEGMENT_S = 300.0
-# Half-extents (m) for vehicle-readable and detail zooms
-VEHICLE_HALF_M = 200.0
-DETAIL_HALF_M = 100.0
-SPIRAL_TURNS = 3.5
+DEFAULT_SEGMENT_S = 200.0
+
+# Fixed view sizes (full width/height of the camera window in meters).
+OVERVIEW_VIEW_M = 2000.0  # 2 km × 2 km
+CLOSE_VIEW_M = 400.0  # 400 m × 400 m
+
+OVERVIEW_HALF_M = OVERVIEW_VIEW_M / 2.0  # 1000 m
+CLOSE_HALF_M = CLOSE_VIEW_M / 2.0  # 200 m
+
+# Back-compat aliases used by callers / tests
+VEHICLE_HALF_M = CLOSE_HALF_M
+DETAIL_HALF_M = CLOSE_HALF_M
+
+SPIRAL_TURNS_MID = 3.5
+SPIRAL_TURNS_DETAIL = 5.5
 
 
 @dataclass(frozen=True)
@@ -76,37 +86,33 @@ def spiral_center(
     *,
     half_w: float,
     half_h: float,
-    turns: float = SPIRAL_TURNS,
+    turns: float = SPIRAL_TURNS_MID,
 ) -> tuple[float, float]:
     """
-    Archimedean spiral from network center outward.
+    Archimedean spiral from network center outward across the polygon.
 
-    ``progress`` in [0, 1]; center stays inset so the view mostly covers the net.
+    ``progress`` in [0, 1]; center travels so a CLOSE_VIEW window sweeps the net.
     """
     p = max(0.0, min(1.0, float(progress)))
     theta = p * float(turns) * 2.0 * math.pi
-    # Max radius so the camera window stays mostly over the network
+    # Allow the 400×400 window to reach the polygon edges (center inset by half).
     max_r_x = max(20.0, 0.5 * bounds.width - half_w)
     max_r_y = max(20.0, 0.5 * bounds.height - half_h)
-    max_r = min(max_r_x, max_r_y)
+    max_r = max(max_r_x, max_r_y)  # cover the longer axis of the study area
     if max_r < 30.0:
-        # Tiny network: still spiral a bit inside the bbox
         max_r = 0.35 * min(bounds.width, bounds.height)
     r = p * max_r
     return bounds.cx + r * math.cos(theta), bounds.cy + r * math.sin(theta)
 
 
-def overview_boundary(bounds: NetBounds, margin: float = 0.04) -> tuple[float, float, float, float]:
-    """Tight fit of the full network (small margin)."""
-    m = max(0.0, float(margin))
-    pad_x = max(15.0, bounds.width * m)
-    pad_y = max(15.0, bounds.height * m)
-    return (
-        bounds.xmin - pad_x,
-        bounds.ymin - pad_y,
-        bounds.xmax + pad_x,
-        bounds.ymax + pad_y,
-    )
+def overview_boundary(
+    bounds: NetBounds,
+    *,
+    view_m: float = OVERVIEW_VIEW_M,
+) -> tuple[float, float, float, float]:
+    """Fixed square overview (default 2×2 km) centered on the network/polygon."""
+    half = max(100.0, float(view_m) / 2.0)
+    return view_boundary_from_center(bounds.cx, bounds.cy, half)
 
 
 def view_boundary_from_center(
@@ -136,13 +142,31 @@ def plan_camera_shot(
     *,
     hotspot: Optional[Tuple[float, float]] = None,
     segment_s: float = DEFAULT_SEGMENT_S,
-    vehicle_half_m: float = VEHICLE_HALF_M,
-    detail_half_m: float = DETAIL_HALF_M,
+    overview_view_m: float = OVERVIEW_VIEW_M,
+    close_view_m: float = CLOSE_VIEW_M,
+    vehicle_half_m: Optional[float] = None,
+    detail_half_m: Optional[float] = None,
 ) -> CameraShot:
+    """
+    Plan the next camera frame.
+
+    ``vehicle_half_m`` / ``detail_half_m`` override half-extents when set;
+    otherwise close views use ``close_view_m`` (400 m → half 200 m).
+    """
     phase, progress = phase_at(sim_t, segment_s=segment_s)
+    close_half = (
+        float(vehicle_half_m)
+        if vehicle_half_m is not None
+        else max(40.0, float(close_view_m) / 2.0)
+    )
+    detail_half = (
+        float(detail_half_m)
+        if detail_half_m is not None
+        else close_half
+    )
 
     if phase == "overview":
-        xmin, ymin, xmax, ymax = overview_boundary(bounds)
+        xmin, ymin, xmax, ymax = overview_boundary(bounds, view_m=overview_view_m)
         return CameraShot(xmin, ymin, xmax, ymax, phase, require_vehicles=False)
 
     if phase == "vehicle_zoom":
@@ -150,11 +174,12 @@ def plan_camera_shot(
             cx, cy = hotspot
         else:
             cx, cy = bounds.cx, bounds.cy
-        xmin, ymin, xmax, ymax = view_boundary_from_center(cx, cy, vehicle_half_m)
+        xmin, ymin, xmax, ymax = view_boundary_from_center(cx, cy, close_half)
         return CameraShot(xmin, ymin, xmax, ymax, phase, require_vehicles=True)
 
-    half = vehicle_half_m if phase == "spiral_mid" else detail_half_m
-    cx, cy = spiral_center(bounds, progress, half_w=half, half_h=half)
+    half = close_half if phase == "spiral_mid" else detail_half
+    turns = SPIRAL_TURNS_MID if phase == "spiral_mid" else SPIRAL_TURNS_DETAIL
+    cx, cy = spiral_center(bounds, progress, half_w=half, half_h=half, turns=turns)
     xmin, ymin, xmax, ymax = view_boundary_from_center(cx, cy, half)
     return CameraShot(xmin, ymin, xmax, ymax, phase, require_vehicles=False)
 

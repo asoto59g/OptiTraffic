@@ -1,6 +1,8 @@
 """Unit tests for scripted video camera phases and spiral."""
 
 from src.video_camera import (
+    CLOSE_VIEW_M,
+    OVERVIEW_VIEW_M,
     NetBounds,
     overview_boundary,
     phase_at,
@@ -9,16 +11,16 @@ from src.video_camera import (
 )
 
 
-def test_phase_schedule_300() -> None:
-    assert phase_at(0, segment_s=300)[0] == "overview"
-    assert phase_at(299, segment_s=300)[0] == "overview"
-    assert phase_at(300, segment_s=300)[0] == "vehicle_zoom"
-    assert phase_at(599, segment_s=300)[0] == "vehicle_zoom"
-    assert phase_at(600, segment_s=300)[0] == "spiral_mid"
-    assert phase_at(900, segment_s=300)[0] == "spiral_detail"
+def test_phase_schedule_200() -> None:
+    assert phase_at(0, segment_s=200)[0] == "overview"
+    assert phase_at(199, segment_s=200)[0] == "overview"
+    assert phase_at(200, segment_s=200)[0] == "vehicle_zoom"
+    assert phase_at(399, segment_s=200)[0] == "vehicle_zoom"
+    assert phase_at(400, segment_s=200)[0] == "spiral_mid"
+    assert phase_at(600, segment_s=200)[0] == "spiral_detail"
     # Loop back to vehicle_zoom (skip overview)
-    assert phase_at(1200, segment_s=300)[0] == "vehicle_zoom"
-    assert phase_at(1500, segment_s=300)[0] == "spiral_mid"
+    assert phase_at(800, segment_s=200)[0] == "vehicle_zoom"
+    assert phase_at(1000, segment_s=200)[0] == "spiral_mid"
 
 
 def test_spiral_starts_near_center() -> None:
@@ -30,20 +32,22 @@ def test_spiral_starts_near_center() -> None:
     assert (x1 - b.cx) ** 2 + (y1 - b.cy) ** 2 > 1000
 
 
-def test_overview_tight_fit() -> None:
-    b = NetBounds(100, 200, 500, 600)
-    xmin, ymin, xmax, ymax = overview_boundary(b, margin=0.04)
-    assert xmin < b.xmin
-    assert xmax > b.xmax
-    assert (xmax - xmin) < b.width * 1.2
+def test_overview_is_2km_square() -> None:
+    b = NetBounds(0, 0, 5000, 4000)
+    xmin, ymin, xmax, ymax = overview_boundary(b)
+    assert abs((xmax - xmin) - OVERVIEW_VIEW_M) < 1e-6
+    assert abs((ymax - ymin) - OVERVIEW_VIEW_M) < 1e-6
+    assert abs(0.5 * (xmin + xmax) - b.cx) < 1e-6
+    assert abs(0.5 * (ymin + ymax) - b.cy) < 1e-6
 
 
-def test_plan_vehicle_uses_hotspot() -> None:
-    b = NetBounds(0, 0, 1000, 1000)
-    shot = plan_camera_shot(350, b, hotspot=(200.0, 300.0), segment_s=300)
-    assert shot.phase == "vehicle_zoom"
-    assert shot.require_vehicles is True
-    cx = 0.5 * (shot.xmin + shot.xmax)
-    cy = 0.5 * (shot.ymin + shot.ymax)
-    assert abs(cx - 200.0) < 1e-6
-    assert abs(cy - 300.0) < 1e-6
+def test_plan_close_views_are_400m() -> None:
+    b = NetBounds(0, 0, 5000, 5000)
+    zoom = plan_camera_shot(250, b, hotspot=(2000.0, 2500.0), segment_s=200)
+    assert zoom.phase == "vehicle_zoom"
+    assert abs((zoom.xmax - zoom.xmin) - CLOSE_VIEW_M) < 1e-6
+    assert abs((zoom.ymax - zoom.ymin) - CLOSE_VIEW_M) < 1e-6
+
+    spiral = plan_camera_shot(450, b, segment_s=200)
+    assert spiral.phase == "spiral_mid"
+    assert abs((spiral.xmax - spiral.xmin) - CLOSE_VIEW_M) < 1e-6
