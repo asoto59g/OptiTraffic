@@ -20,6 +20,9 @@ log = get_logger("scenarios")
 ROOT = Path(__file__).resolve().parents[1]
 SCENARIOS_DIR = ROOT / "scenarios"
 
+# Shipped demo (Liberia, CR) — auto-loaded when the session has no study area.
+DEFAULT_EXAMPLE_SCENARIO = "default_mvp_20260913_174921"
+
 # Files that make a self-contained sumo-gui project (opened via *.sumocfg).
 _SUMO_PROJECT_FILES = (
     "sim.net.xml",
@@ -154,6 +157,36 @@ def list_scenarios() -> list[Path]:
         key=lambda p: (p / "scenario.json").stat().st_mtime,
         reverse=True,
     )
+
+
+def default_example_scenario_path() -> Optional[Path]:
+    """Path to the shipped demo scenario, or None if missing."""
+    folder = SCENARIOS_DIR / DEFAULT_EXAMPLE_SCENARIO
+    if folder.is_dir() and (folder / "scenario.json").is_file():
+        return folder
+    return None
+
+
+def apply_default_example_if_empty(session: Any) -> bool:
+    """
+    If the wizard has no study area yet, load the shipped example once.
+    Returns True when the example was applied.
+    """
+    if getattr(session, "area", None) is not None:
+        return False
+    if getattr(session, "_default_scenario_applied", False):
+        return False
+    folder = default_example_scenario_path()
+    session._default_scenario_applied = True
+    if folder is None:
+        return False
+    try:
+        data = load_scenario(folder)
+        apply_scenario_to_session(data, session)
+        return True
+    except Exception:
+        log.warning("No se pudo cargar el escenario de ejemplo %s", folder, exc_info=True)
+        return False
 
 
 def polygon_iou(a, b) -> float:

@@ -11,13 +11,21 @@ data/osm/
 data/nets/
 data/runs/
 data/cache/
+# Local user scenarios stay private; ship one curated example.
 scenarios/*/
 !scenarios/.gitkeep
+!scenarios/default_mvp_20260913_174921/
+!scenarios/default_mvp_20260913_174921/**
 *.pbf
 *.net.xml
 *.sumocfg
 *.rou.xml
 *.trips.xml
+# Re-include SUMO artifacts for the shipped example only.
+!scenarios/default_mvp_20260913_174921/**/*.net.xml
+!scenarios/default_mvp_20260913_174921/**/*.sumocfg
+!scenarios/default_mvp_20260913_174921/**/*.rou.xml
+!scenarios/default_mvp_20260913_174921/**/*.trips.xml
 *.egg-info/
 app.py.bak
 app.py.badenc

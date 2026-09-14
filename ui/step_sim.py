@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 import streamlit as st
 
@@ -37,11 +41,13 @@ from src.network_build import (  # noqa: E402
 )
 from src.simulate import (  # noqa: E402
     SAFE_RUNS,
+    SimResult,
     _close_traci,
     export_edge_csv,
     export_edge_geojson,
     find_ffmpeg,
-    run_simulation,
+    read_sim_progress,
+    write_sim_progress,
     write_sumocfg,
 )
 from src.sumo_env import detect_sumo  # noqa: E402
@@ -63,6 +69,363 @@ from src.viz import (  # noqa: E402
     nearest_edge_id,
     simplify_edges_for_map,
 )
+
+
+def _pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return str(pid) in (out.stdout or "")
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _sumo_process_running() -> bool:
+    """True if any sumo / sumo-gui process is alive (Windows/POSIX best-effort)."""
+    if sys.platform == "win32":
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq sumo-gui.exe", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if "sumo-gui.exe" in (out.stdout or "").lower():
+                return True
+            out2 = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq sumo.exe", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return "sumo.exe" in (out2.stdout or "").lower()
+        except Exception:
+            return False
+    try:
+        r = subprocess.run(
+            ["pgrep", "-f", r"sumo(-gui)?"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return bool((r.stdout or "").strip())
+    except Exception:
+        return False
+
+
+def _progress_is_fresh(prog: dict, max_age_s: float = 90.0) -> bool:
+    """True if sim_progress.json was updated recently (worker still writing)."""
+    try:
+        updated = float(prog.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    if updated <= 0:
+        return False
+    return (time.time() - updated) <= max_age_s
+
+
+def _worker_appears_alive(pid: int, prog: dict) -> bool:
+    """
+    Prefer PID; fall back to fresh progress / live sumo-gui.
+    Progress used to overwrite pid=None, so PID alone is not reliable.
+    """
+    if pid and _pid_running(pid):
+        return True
+    if str(prog.get("status") or "") != "running":
+        return False
+    if _progress_is_fresh(prog):
+        return True
+    return _sumo_process_running()
+
+
+def peek_running_sim_on_disk() -> dict | None:
+    """
+    If a background worker is still running under runs/current, return job+progress.
+    Used when Streamlit session was lost (PC sleep / browser refresh).
+    """
+    run_dir = SAFE_RUNS / "current"
+    progress_path = run_dir / "sim_progress.json"
+    job_path = run_dir / "sim_job.json"
+    prog = read_sim_progress(progress_path) or {}
+    if str(prog.get("status") or "") != "running":
+        return None
+    if not job_path.is_file():
+        return None
+    try:
+        job = json.loads(job_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    pid = int(prog.get("pid") or job.get("pid") or 0)
+    if not _worker_appears_alive(pid, prog):
+        return None
+    return {
+        "job": {
+            **job,
+            "pid": pid or int(job.get("pid") or 0),
+            "progress_file": str(progress_path),
+            "result_file": str(run_dir / "sim_result.json"),
+            "run_dir": str(run_dir),
+        },
+        "progress": prog,
+        "run_dir": str(run_dir),
+    }
+
+
+def restore_running_sim_after_session_loss(session: Any) -> bool:
+    """
+    Revive sim_job in session and restore study area if needed.
+    Returns True when a background sim is still running.
+    """
+    peeked = peek_running_sim_on_disk()
+    if not peeked:
+        return False
+    job = peeked["job"]
+    session.sim_job = job
+    session._default_scenario_applied = True
+
+    # Restore network/area so step 5 can render (session was wiped).
+    if getattr(session, "area", None) is None or not getattr(session, "edges_gj", None):
+        restore = job.get("ui_restore") or {}
+        folder_s = str(restore.get("scenario_folder") or session.get("scenario_folder") or "")
+        loaded = False
+        if folder_s:
+            folder = Path(folder_s)
+            if folder.is_dir() and (folder / "scenario.json").is_file():
+                try:
+                    from src.scenarios import apply_scenario_to_session, load_scenario
+
+                    apply_scenario_to_session(load_scenario(folder), session)
+                    loaded = True
+                except Exception:
+                    loaded = False
+        if not loaded:
+            try:
+                from src.scenarios import apply_default_example_if_empty
+
+                # Force attempt even if flag was set above
+                session._default_scenario_applied = False
+                apply_default_example_if_empty(session)
+                session._default_scenario_applied = True
+            except Exception:
+                pass
+
+    # Always park the wizard on Simulación while the worker runs.
+    session.step = STEPS[4]
+    session.nav_step = STEPS[4]
+    session._pending_nav = STEPS[4]
+    session._show_sim_resumed = True
+    return True
+
+
+def _finalize_sim_outputs(
+    *,
+    run_dir: Path,
+    edges_gj: dict,
+    dens_key: str,
+    base_rate: int,
+    preload_vph: int,
+    duration: int,
+    warmup: int,
+    gates: list,
+    record_video: bool,
+    result: SimResult,
+) -> None:
+    st.session_state.sim_result = result
+    export_edge_csv(result, run_dir / "edges.csv")
+    export_edge_geojson(edges_gj, result, run_dir / "edges_result.geojson")
+    (run_dir / "kpis.json").write_text(
+        json.dumps(
+            {
+                "mean_speed": result.mean_speed,
+                "pct_edges_congested": result.pct_edges_congested,
+                "total_waiting": result.total_waiting,
+                "tomtom_correlation": result.tomtom_correlation,
+                "vehicle_steps": result.vehicle_steps,
+                "density_scenario": dens_key,
+                "density_base_veh_h": int(base_rate),
+                "preload_vph": int(preload_vph),
+                "duration_s": int(duration),
+                "warmup_s": int(warmup),
+                "flow_gates": gates_to_list(gates),
+                "demand_mode": "gates" if gates else "seed",
+                "record_video": bool(record_video),
+                "video_path": result.video_path,
+                "frames_count": result.frames_count,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    _bump_map()
+    vid_msg = ""
+    if result.video_path:
+        vid_msg = f" · video={Path(result.video_path).name}"
+    elif result.frames_count:
+        vid_msg = f" · {result.frames_count} frames PNG"
+    st.success(
+        f"Simulación OK · veh-steps={result.vehicle_steps} · "
+        f"v_media={result.mean_speed:.2f} m/s · modo="
+        f"{'puertas' if gates else 'repartido'}{vid_msg}"
+    )
+    st.session_state.pop("sim_job", None)
+    # Leave step 5 so the simulate button is not left disabled on this page.
+    go_to(STEPS[5])
+    st.rerun()
+
+
+def _recover_sim_job_from_disk() -> None:
+    """If Streamlit lost session state, revive job from runs/current progress."""
+    if st.session_state.get("sim_job"):
+        return
+    peeked = peek_running_sim_on_disk()
+    if peeked:
+        st.session_state.sim_job = peeked["job"]
+
+
+def _handle_sim_job_ui(edges_gj: dict) -> bool:
+    """
+    Poll background TraCI worker. Returns True if a job is active (caller should
+    still render controls, but skip starting a second run).
+    """
+    _recover_sim_job_from_disk()
+    job = st.session_state.get("sim_job")
+    if not job:
+        return False
+    run_dir = Path(job["run_dir"])
+    progress_path = Path(job.get("progress_file") or (run_dir / "sim_progress.json"))
+    result_path = Path(job.get("result_file") or (run_dir / "sim_result.json"))
+    prog = read_sim_progress(progress_path) or {}
+    pid = int(prog.get("pid") or job.get("pid") or 0)
+    alive = _worker_appears_alive(pid, prog)
+    status = str(prog.get("status") or ("running" if alive else "unknown"))
+
+    if status == "done" and result_path.is_file():
+        try:
+            result = SimResult.from_dict(
+                json.loads(result_path.read_text(encoding="utf-8"))
+            )
+        except Exception as e:
+            st.error(f"Simulación terminó pero no se pudo leer el resultado: {e}")
+            st.session_state.pop("sim_job", None)
+            return False
+        _finalize_sim_outputs(
+            run_dir=run_dir,
+            edges_gj=edges_gj,
+            dens_key=str(job.get("density_scenario") or ""),
+            base_rate=int(job.get("base_rate") or 0),
+            preload_vph=int(job.get("preload_vph") or 0),
+            duration=int(job.get("duration") or result.duration_s),
+            warmup=int(job.get("warmup") or 0),
+            gates=gates_from_list(job.get("flow_gates") or []),
+            record_video=bool(job.get("record_video")),
+            result=result,
+        )
+        return False  # unreachable if finalize reruns
+
+    if status == "done":
+        # Finished but result file missing — unlock the simulate button.
+        st.session_state.pop("sim_job", None)
+        return False
+
+    if status == "error":
+        st.error(f"Simulación (fondo): {prog.get('error') or 'error desconocido'}")
+        tb = prog.get("traceback")
+        if tb:
+            with st.expander("Detalle"):
+                st.code(str(tb))
+        st.session_state.pop("sim_job", None)
+        return False
+
+    if not alive and status == "running":
+        # Worker died without writing done/error — salvage partial result if present.
+        if result_path.is_file():
+            try:
+                result = SimResult.from_dict(
+                    json.loads(result_path.read_text(encoding="utf-8"))
+                )
+                st.warning(
+                    "SUMO se detuvo antes de tiempo; se cargan resultados parciales "
+                    f"(t≈{result.duration_s}s, frames={result.frames_count})."
+                )
+                _finalize_sim_outputs(
+                    run_dir=run_dir,
+                    edges_gj=edges_gj,
+                    dens_key=str(job.get("density_scenario") or ""),
+                    base_rate=int(job.get("base_rate") or 0),
+                    preload_vph=int(job.get("preload_vph") or 0),
+                    duration=int(job.get("duration") or result.duration_s),
+                    warmup=int(job.get("warmup") or 0),
+                    gates=gates_from_list(job.get("flow_gates") or []),
+                    record_video=bool(job.get("record_video")),
+                    result=result,
+                )
+                return False
+            except Exception:
+                pass
+        st.error(
+            "El proceso SUMO se detuvo sin terminar (¿cerró la ventana sumo-gui?). "
+            "Vuelva a lanzar la simulación; para 7200s+video use captura corta o sin video."
+        )
+        st.session_state.pop("sim_job", None)
+        return False
+
+    t = float(prog.get("t") or 0.0)
+    end = float(prog.get("end") or job.get("duration") or 1.0)
+    frames = int(prog.get("frames") or 0)
+    phase = str(prog.get("camera_phase") or "")
+    pct = min(1.0, max(0.0, t / end)) if end > 0 else 0.0
+    st.info(
+        f"**Simulación en segundo plano** · {t:.0f}/{end:.0f} s"
+        + (f" · fase `{phase}`" if phase else "")
+        + (f" · frames={frames}" if job.get("record_video") else "")
+        + (f" · PID {pid}" if pid else "")
+    )
+    st.progress(pct)
+    updated = prog.get("updated_at")
+    if updated:
+        st.caption(f"Última actualización de progreso: {float(updated):.0f} (epoch s)")
+    st.caption(
+        "No cierre sumo-gui. Puede dejar la ventana detrás de otras apps. "
+        "Si la barra no avanza, pulse «Actualizar progreso»."
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Actualizar progreso", width="stretch"):
+            st.rerun()
+    with c2:
+        if st.button("Cancelar simulación", width="stretch", type="secondary"):
+            try:
+                if sys.platform == "win32" and pid:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T", "/F"],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                elif pid:
+                    os.kill(pid, 15)
+            except Exception:
+                pass
+            _close_traci()
+            write_sim_progress(progress_path, status="error", error="cancelado_por_usuario")
+            st.session_state.pop("sim_job", None)
+            st.warning("Simulación cancelada.")
+            st.rerun()
+    # Soft auto-refresh while job runs (does not kill the worker).
+    time.sleep(2.0)
+    st.rerun()
+    return True
 
 
 def step_sim() -> None:
@@ -406,7 +769,9 @@ def step_sim() -> None:
     st.markdown("**Tiempo de simulación**")
     st.caption(
         "Use ≥ 1 h para que la red se llene y se vean represamientos. "
-        "El warmup no cuenta en los KPIs (solo estabiliza el flujo)."
+        "El warmup no cuenta en los KPIs (solo estabiliza el flujo). "
+        "Con 7200 s (2 h) la simulación corre en **segundo plano**: puede mover el mouse "
+        "sin cortar TraCI."
     )
     duration = st.slider(
         "Duración total (s)",
@@ -475,19 +840,46 @@ def step_sim() -> None:
         key="record_video",
         disabled=not gui_ok,
         help=(
-            "Abre sumo-gui, captura pantallas cada N segundos de simulación y "
-            "arma un MP4 con ffmpeg. Más lento que sumo headless. "
-            "No minimice la ventana de SUMO mientras graba."
+            "Abre sumo-gui y captura frames (TraCI). Puede minimizar la ventana; "
+            "si la cierra, TraCI se corta y la simulación termina."
         ),
     )
     record_every = 10.0
     video_fps = 5.0
+    video_capture = "screen"
     if record_video and gui_ok:
+        st.info(
+            "El video **requiere sumo-gui**. **No cierre** la ventana o TraCI se corta. "
+            "Puede dejarla detrás de otras apps (no la minimice si usa captura TraCI). "
+            "Si la GUI cae, el worker reintenta **headless** para completar KPIs y conserva frames parciales."
+        )
+        if int(duration) >= 3600:
+            st.warning(
+                f"Duración larga ({int(duration)} s) + video es frágil en Windows. "
+                "Para KPIs completos: desactive video, o use un muestreo corto (p. ej. 1800 s)."
+            )
         st.warning(
-            "La grabación espera a que haya **vehículos**, enfoca el **punto con más tráfico** "
-            "y alterna acercamiento/alejamiento cada **30 s** de simulación. "
-            "Deje sumo-gui visible; el MP4 se arma al final. "
-            "Con grabación la simulación es más lenta (~100 ms/paso)."
+            "Guion de cámara (**200 s** de simulación por toma): "
+            "**1)** vista general **2×2 km** → "
+            "**2)** acercamiento **400×400 m** (tráfico) → "
+            "**3–4)** espirales **400×400 m** sobre todo el polígono → "
+            "**5)** vuelve a (2)."
+        )
+        video_capture = st.radio(
+            "Modo de captura",
+            options=["screen", "traci"],
+            format_func=lambda k: {
+                "screen": "Pantalla (recomendado · ventana abierta)",
+                "traci": "TraCI (experimental)",
+            }[k],
+            horizontal=True,
+            index=0,
+            key="video_capture_mode_v2",
+            help=(
+                "Pantalla: ImageGrab de sumo-gui (más estable en Windows). "
+                "Puede dejar la ventana detrás de otras, pero NO la cierre. "
+                "TraCI a veces cierra SUMO en Windows."
+            ),
         )
         rc1, rc2 = st.columns(2)
         with rc1:
@@ -496,10 +888,10 @@ def step_sim() -> None:
                     "Intervalo de captura (s sim)",
                     5,
                     60,
-                    10,
+                    5,
                     5,
                     key="record_every_s",
-                    help="5–10 s suele bastar para un video corto y legible.",
+                    help="5 s da espirales más fluidas (~40 frames por toma de 200 s).",
                 )
             )
         with rc2:
@@ -514,11 +906,25 @@ def step_sim() -> None:
                     help="Cuadros por segundo al ensamblar el video.",
                 )
             )
+        camera_segment_s = float(
+            st.number_input(
+                "Duración de cada toma del guion (s sim)",
+                min_value=60,
+                max_value=900,
+                value=200,
+                step=20,
+                key="camera_segment_s_v2",
+                help="Por defecto 200 s: overview 2×2 km, zoom/espirales 400×400 m.",
+            )
+        )
         n_est = max(1, int(duration / record_every))
+        n_segments = max(1, int(duration / camera_segment_s))
         st.caption(
-            f"≈ {n_est} capturas · ventana GUI 1280×720 · "
+            f"≈ {n_est} capturas · ~{n_segments} tomas de guion · ventana GUI 1280×720 · "
             f"{'MP4 al final' if ff_ok else 'solo PNG (sin ffmpeg)'}"
         )
+    else:
+        camera_segment_s = 200.0
 
     base_rate = st.slider(
         f"Densidad base (solo si no hay puertas) — {dens.label}",
@@ -556,7 +962,21 @@ def step_sim() -> None:
     edge_ids = [f["properties"]["id"] for f in edges_gj.get("features", []) if f.get("properties", {}).get("id")]
     seeds = edge_ids[:: max(1, len(edge_ids) // 80)][:80] if edge_ids else []
 
-    if st.button("Generar demanda y simular", type="primary"):
+    job_active = _handle_sim_job_ui(edges_gj)
+    # Only block a new run while a background job is still running.
+    job = st.session_state.get("sim_job")
+    sim_busy = False
+    if job:
+        run_dir = Path(job.get("run_dir") or (SAFE_RUNS / "current"))
+        prog = read_sim_progress(Path(job.get("progress_file") or (run_dir / "sim_progress.json"))) or {}
+        pid = int(prog.get("pid") or job.get("pid") or 0)
+        sim_busy = str(prog.get("status") or "") == "running" and _worker_appears_alive(pid, prog)
+
+    if st.button(
+        "Generar demanda y simular",
+        type="primary",
+        disabled=bool(job_active or sim_busy),
+    ):
         SAFE_RUNS.mkdir(parents=True, exist_ok=True)
         run_dir = SAFE_RUNS / "current"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -605,7 +1025,6 @@ def step_sim() -> None:
             # Belt-and-suspenders: never hand SUMO an unsorted route file
             sort_demand_xml(run_dir / "trips.xml")
             sort_demand_xml(Path(routes))
-
 
             adds = write_all_additionals(
                 run_dir, st.session_state.edits, tls_ids, net_path=sim_net
@@ -660,77 +1079,87 @@ def step_sim() -> None:
                 end=int(duration),
                 gui_settings_file=gui_settings,
             )
-            status.info(
-                f"Ejecutando SUMO ({duration}s · warmup {warmup}s"
-                + (" · grabando video" if record_video else "")
-                + ")… puede tardar varios minutos."
+
+            progress_path = run_dir / "sim_progress.json"
+            result_path = run_dir / "sim_result.json"
+            for stale in (progress_path, result_path):
+                try:
+                    if stale.is_file():
+                        stale.unlink()
+                except OSError:
+                    pass
+            write_sim_progress(
+                progress_path,
+                status="running",
+                t=0.0,
+                end=float(duration),
+                frames=0,
+                message="launching_worker",
             )
 
-            def _on_progress(t: float, end_t: float, frames: int) -> None:
-                status.info(
-                    f"SUMO {t:.0f}/{end_t:.0f}s"
-                    + (f" · frames={frames}" if record_video else "")
-                    + "…"
-                )
+            job = {
+                "run_dir": str(run_dir),
+                "cfg": str(cfg),
+                "edge_levels": st.session_state.edge_levels or {},
+                "warmup_s": float(warmup),
+                "record_video": bool(record_video and gui_ok),
+                "record_every_s": float(record_every),
+                "frames_dir": str(run_dir / "frames"),
+                "video_path": str(run_dir / "simulation.mp4"),
+                "video_fps": float(video_fps),
+                "camera_segment_s": float(camera_segment_s),
+                "video_capture": str(video_capture),
+                "progress_file": str(progress_path),
+                "result_file": str(result_path),
+                "end": float(duration),
+                "duration": int(duration),
+                "warmup": int(warmup),
+                "density_scenario": dens.key,
+                "base_rate": int(base_rate),
+                "preload_vph": int(preload_vph) if gates else 0,
+                "flow_gates": gates_to_list(gates),
+                # So Streamlit can resume step 5 after PC sleep / session loss
+                "ui_restore": {
+                    "step": STEPS[4],
+                    "scenario_folder": str(st.session_state.get("scenario_folder") or ""),
+                    "city": str(st.session_state.get("city") or ""),
+                    "country": str(st.session_state.get("country") or ""),
+                    "net_path": str(st.session_state.get("net_path") or ""),
+                },
+            }
+            job_path = run_dir / "sim_job.json"
+            job_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
 
-            with st.spinner(
-                "Ejecutando SUMO-GUI + capturas… (mire el reloj en sumo-gui)"
-                if record_video
-                else "Ejecutando SUMO (TraCI)…"
-            ):
-                result = run_simulation(
-                    cfg,
-                    sumo=sumo,
-                    edge_levels=st.session_state.edge_levels or None,
-                    warmup_s=float(warmup),
-                    record_video=bool(record_video and gui_ok),
-                    record_every_s=float(record_every),
-                    frames_dir=run_dir / "frames",
-                    video_path=run_dir / "simulation.mp4",
-                    video_fps=float(video_fps),
-                    progress_cb=_on_progress,
-                )
-            st.session_state.sim_result = result
-            export_edge_csv(result, run_dir / "edges.csv")
-            export_edge_geojson(edges_gj, result, run_dir / "edges_result.geojson")
-            (run_dir / "kpis.json").write_text(
-                json.dumps(
-                    {
-                        "mean_speed": result.mean_speed,
-                        "pct_edges_congested": result.pct_edges_congested,
-                        "total_waiting": result.total_waiting,
-                        "tomtom_correlation": result.tomtom_correlation,
-                        "vehicle_steps": result.vehicle_steps,
-                        "density_scenario": dens.key,
-                        "density_base_veh_h": int(base_rate),
-                        "density_cap_veh_h": dens.per_dir_max,
-                        "preload_vph": int(preload_vph) if gates else 0,
-                        "duration_s": int(duration),
-                        "warmup_s": int(warmup),
-                        "flow_gates": gates_to_list(gates),
-                        "demand_mode": "gates" if gates else "seed",
-                        "record_video": bool(record_video and gui_ok),
-                        "video_path": result.video_path,
-                        "frames_count": result.frames_count,
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
+            creationflags = 0
+            if sys.platform == "win32":
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "src.sim_worker", str(job_path)],
+                cwd=str(ROOT),
+                creationflags=creationflags,
             )
-            _bump_map()
-            vid_msg = ""
-            if result.video_path:
-                vid_msg = f" · video={Path(result.video_path).name}"
-            elif result.frames_count:
-                vid_msg = f" · {result.frames_count} frames PNG"
+            job_with_pid = {
+                **job,
+                "pid": int(proc.pid),
+                "job_path": str(job_path),
+            }
+            try:
+                job_path.write_text(
+                    json.dumps(job_with_pid, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+            st.session_state.sim_job = job_with_pid
             status.success(
-                f"Simulación OK · veh-steps={result.vehicle_steps} · "
-                f"v_media={result.mean_speed:.2f} m/s · modo="
-                f"{'puertas' if gates else 'repartido'}{vid_msg}"
+                f"SUMO lanzado en segundo plano (PID {proc.pid}) · duración {duration}s. "
+                "Puede mover el mouse; el progreso se actualiza solo."
             )
-            go_to(STEPS[5])
+            time.sleep(0.5)
+            st.rerun()
         except Exception as e:
             _close_traci()
+            st.session_state.pop("sim_job", None)
             status.error(f"Simulación: {e}")
             st.exception(e)
 

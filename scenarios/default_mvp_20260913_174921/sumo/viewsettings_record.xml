@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<viewsettings>
+    <scheme name="real world">
+        <vehicles vehicle_exaggeration="2.5" vehicle_minSize="3" vehicle_constantSize="0"
+                  vehicle_quality="2" showBlinker="0"/>
+        <persons person_exaggeration="1" person_minSize="1" person_constantSize="0"/>
+        <edges edge_exaggeration="1.0"/>
+    </scheme>
+    <delay value="100"/>
+</viewsettings>
