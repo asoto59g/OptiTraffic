@@ -733,6 +733,7 @@ def run_simulation(
     _close_traci(label)
 
     cfg_safe = cfg_path if path_is_safe(cfg_path) else to_safe_path(cfg_path)
+    worker_pid = os.getpid()
 
     use_gui = bool(record_video)
     if use_gui:
@@ -921,6 +922,7 @@ def run_simulation(
                     camera_phase=last_camera_phase or "",
                     capture_mode=active_capture_mode,
                     message=message or "running",
+                    pid=int(worker_pid),
                 )
             except Exception:
                 log.debug("write_sim_progress falló", exc_info=True)

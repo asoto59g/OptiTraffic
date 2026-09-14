@@ -92,6 +92,64 @@ def _pid_running(pid: int) -> bool:
         return False
 
 
+def _sumo_process_running() -> bool:
+    """True if any sumo / sumo-gui process is alive (Windows/POSIX best-effort)."""
+    if sys.platform == "win32":
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq sumo-gui.exe", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if "sumo-gui.exe" in (out.stdout or "").lower():
+                return True
+            out2 = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq sumo.exe", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return "sumo.exe" in (out2.stdout or "").lower()
+        except Exception:
+            return False
+    try:
+        r = subprocess.run(
+            ["pgrep", "-f", r"sumo(-gui)?"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return bool((r.stdout or "").strip())
+    except Exception:
+        return False
+
+
+def _progress_is_fresh(prog: dict, max_age_s: float = 90.0) -> bool:
+    """True if sim_progress.json was updated recently (worker still writing)."""
+    try:
+        updated = float(prog.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    if updated <= 0:
+        return False
+    return (time.time() - updated) <= max_age_s
+
+
+def _worker_appears_alive(pid: int, prog: dict) -> bool:
+    """
+    Prefer PID; fall back to fresh progress / live sumo-gui.
+    Progress used to overwrite pid=None, so PID alone is not reliable.
+    """
+    if pid and _pid_running(pid):
+        return True
+    if str(prog.get("status") or "") != "running":
+        return False
+    if _progress_is_fresh(prog):
+        return True
+    return _sumo_process_running()
+
+
 def peek_running_sim_on_disk() -> dict | None:
     """
     If a background worker is still running under runs/current, return job+progress.
@@ -110,7 +168,7 @@ def peek_running_sim_on_disk() -> dict | None:
     except Exception:
         return None
     pid = int(prog.get("pid") or job.get("pid") or 0)
-    if pid and not _pid_running(pid):
+    if not _worker_appears_alive(pid, prog):
         return None
     return {
         "job": {
@@ -250,7 +308,7 @@ def _handle_sim_job_ui(edges_gj: dict) -> bool:
     result_path = Path(job.get("result_file") or (run_dir / "sim_result.json"))
     prog = read_sim_progress(progress_path) or {}
     pid = int(prog.get("pid") or job.get("pid") or 0)
-    alive = _pid_running(pid) if pid else False
+    alive = _worker_appears_alive(pid, prog)
     status = str(prog.get("status") or ("running" if alive else "unknown"))
 
     if status == "done" and result_path.is_file():
@@ -291,10 +349,34 @@ def _handle_sim_job_ui(edges_gj: dict) -> bool:
         return False
 
     if not alive and status == "running":
-        # Worker died without writing done/error
+        # Worker died without writing done/error — salvage partial result if present.
+        if result_path.is_file():
+            try:
+                result = SimResult.from_dict(
+                    json.loads(result_path.read_text(encoding="utf-8"))
+                )
+                st.warning(
+                    "SUMO se detuvo antes de tiempo; se cargan resultados parciales "
+                    f"(t≈{result.duration_s}s, frames={result.frames_count})."
+                )
+                _finalize_sim_outputs(
+                    run_dir=run_dir,
+                    edges_gj=edges_gj,
+                    dens_key=str(job.get("density_scenario") or ""),
+                    base_rate=int(job.get("base_rate") or 0),
+                    preload_vph=int(job.get("preload_vph") or 0),
+                    duration=int(job.get("duration") or result.duration_s),
+                    warmup=int(job.get("warmup") or 0),
+                    gates=gates_from_list(job.get("flow_gates") or []),
+                    record_video=bool(job.get("record_video")),
+                    result=result,
+                )
+                return False
+            except Exception:
+                pass
         st.error(
             "El proceso SUMO se detuvo sin terminar (¿cerró la ventana sumo-gui?). "
-            "Vuelva a lanzar la simulación."
+            "Vuelva a lanzar la simulación; para 7200s+video use captura corta o sin video."
         )
         st.session_state.pop("sim_job", None)
         return False
@@ -768,9 +850,14 @@ def step_sim() -> None:
     if record_video and gui_ok:
         st.info(
             "El video **requiere sumo-gui**. **No cierre** la ventana o TraCI se corta. "
-            "Puede dejarla detrás de otras apps. El avance se guarda en disco "
-            "(pulse «Actualizar progreso» si la barra no se mueve sola)."
+            "Puede dejarla detrás de otras apps (no la minimice si usa captura TraCI). "
+            "Si la GUI cae, el worker reintenta **headless** para completar KPIs y conserva frames parciales."
         )
+        if int(duration) >= 3600:
+            st.warning(
+                f"Duración larga ({int(duration)} s) + video es frágil en Windows. "
+                "Para KPIs completos: desactive video, o use un muestreo corto (p. ej. 1800 s)."
+            )
         st.warning(
             "Guion de cámara (**200 s** de simulación por toma): "
             "**1)** vista general **2×2 km** → "
@@ -883,7 +970,7 @@ def step_sim() -> None:
         run_dir = Path(job.get("run_dir") or (SAFE_RUNS / "current"))
         prog = read_sim_progress(Path(job.get("progress_file") or (run_dir / "sim_progress.json"))) or {}
         pid = int(prog.get("pid") or job.get("pid") or 0)
-        sim_busy = str(prog.get("status") or "") == "running" and (not pid or _pid_running(pid))
+        sim_busy = str(prog.get("status") or "") == "running" and _worker_appears_alive(pid, prog)
 
     if st.button(
         "Generar demanda y simular",
@@ -1051,11 +1138,19 @@ def step_sim() -> None:
                 cwd=str(ROOT),
                 creationflags=creationflags,
             )
-            st.session_state.sim_job = {
+            job_with_pid = {
                 **job,
                 "pid": int(proc.pid),
                 "job_path": str(job_path),
             }
+            try:
+                job_path.write_text(
+                    json.dumps(job_with_pid, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+            st.session_state.sim_job = job_with_pid
             status.success(
                 f"SUMO lanzado en segundo plano (PID {proc.pid}) · duración {duration}s. "
                 "Puede mover el mouse; el progreso se actualiza solo."
