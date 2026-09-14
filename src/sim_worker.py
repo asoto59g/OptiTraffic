@@ -8,6 +8,7 @@ Long simulations (e.g. 7200 s) used to die when the browser/Streamlit reran
 from __future__ import annotations
 
 import json
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -38,6 +39,7 @@ def main(argv: list[str] | None = None) -> int:
         t=0.0,
         end=float(job.get("end") or 0),
         frames=0,
+        pid=os.getpid(),
         message="worker_started",
     )
     try:
@@ -53,21 +55,24 @@ def main(argv: list[str] | None = None) -> int:
             video_path=Path(job["video_path"]) if job.get("video_path") else None,
             video_fps=float(job.get("video_fps") or 5),
             camera_segment_s=float(job.get("camera_segment_s") or 200),
-            video_capture=str(job.get("video_capture") or "traci"),
+            video_capture=str(job.get("video_capture") or "screen"),
             progress_file=progress_path,
         )
         result_path.write_text(
             json.dumps(result.to_dict(), ensure_ascii=False),
             encoding="utf-8",
         )
+        note = getattr(result, "_corr_detail", "") or ""
         write_sim_progress(
             progress_path,
             status="done",
             t=float(result.duration_s),
-            end=float(result.duration_s),
+            end=float(job.get("end") or result.duration_s),
             frames=int(result.frames_count),
             vehicle_steps=int(result.vehicle_steps),
-            message="ok",
+            pid=os.getpid(),
+            message="ok_partial" if "parciales" in note else "ok",
+            detail=note[-500:] if note else "",
         )
         return 0
     except Exception as e:
@@ -76,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
             status="error",
             error=str(e),
             traceback=traceback.format_exc()[-4000:],
+            pid=os.getpid(),
             message="failed",
         )
         print(traceback.format_exc(), file=sys.stderr)

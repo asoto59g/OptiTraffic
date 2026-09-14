@@ -145,20 +145,49 @@ def _finalize_sim_outputs(
     go_to(STEPS[5])
 
 
+def _recover_sim_job_from_disk() -> None:
+    """If Streamlit lost session state, revive job from runs/current progress."""
+    if st.session_state.get("sim_job"):
+        return
+    run_dir = SAFE_RUNS / "current"
+    progress_path = run_dir / "sim_progress.json"
+    job_path = run_dir / "sim_job.json"
+    prog = read_sim_progress(progress_path) or {}
+    if str(prog.get("status") or "") != "running":
+        return
+    if not job_path.is_file():
+        return
+    try:
+        job = json.loads(job_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    pid = int(prog.get("pid") or job.get("pid") or 0)
+    if pid and not _pid_running(pid):
+        return
+    st.session_state.sim_job = {
+        **job,
+        "pid": pid or int(job.get("pid") or 0),
+        "progress_file": str(progress_path),
+        "result_file": str(run_dir / "sim_result.json"),
+        "run_dir": str(run_dir),
+    }
+
+
 def _handle_sim_job_ui(edges_gj: dict) -> bool:
     """
     Poll background TraCI worker. Returns True if a job is active (caller should
     still render controls, but skip starting a second run).
     """
+    _recover_sim_job_from_disk()
     job = st.session_state.get("sim_job")
     if not job:
         return False
     run_dir = Path(job["run_dir"])
     progress_path = Path(job.get("progress_file") or (run_dir / "sim_progress.json"))
     result_path = Path(job.get("result_file") or (run_dir / "sim_result.json"))
-    pid = int(job.get("pid") or 0)
-    alive = _pid_running(pid)
     prog = read_sim_progress(progress_path) or {}
+    pid = int(prog.get("pid") or job.get("pid") or 0)
+    alive = _pid_running(pid) if pid else False
     status = str(prog.get("status") or ("running" if alive else "unknown"))
 
     if status == "done" and result_path.is_file():
@@ -205,16 +234,21 @@ def _handle_sim_job_ui(edges_gj: dict) -> bool:
     t = float(prog.get("t") or 0.0)
     end = float(prog.get("end") or job.get("duration") or 1.0)
     frames = int(prog.get("frames") or 0)
+    phase = str(prog.get("camera_phase") or "")
     pct = min(1.0, max(0.0, t / end)) if end > 0 else 0.0
     st.info(
         f"**Simulación en segundo plano** · {t:.0f}/{end:.0f} s"
+        + (f" · fase `{phase}`" if phase else "")
         + (f" · frames={frames}" if job.get("record_video") else "")
-        + f" · PID {pid}"
+        + (f" · PID {pid}" if pid else "")
     )
     st.progress(pct)
+    updated = prog.get("updated_at")
+    if updated:
+        st.caption(f"Última actualización de progreso: {float(updated):.0f} (epoch s)")
     st.caption(
-        "Puede mover el mouse o cambiar de ventana: TraCI sigue en otro proceso. "
-        "Evite pulsar de nuevo «Generar demanda y simular» hasta que termine."
+        "No cierre sumo-gui. Puede dejar la ventana detrás de otras apps. "
+        "Si la barra no avanza, pulse «Actualizar progreso»."
     )
     c1, c2 = st.columns(2)
     with c1:
@@ -662,12 +696,12 @@ def step_sim() -> None:
     )
     record_every = 10.0
     video_fps = 5.0
-    video_capture = "traci"
+    video_capture = "screen"
     if record_video and gui_ok:
         st.info(
-            "El video **requiere sumo-gui** (SUMO no renderiza sin GUI). "
-            "Por defecto se graba en **segundo plano** con TraCI: puede **minimizar** "
-            "la ventana y seguir usando el PC. **No cierre** sumo-gui o el proceso se detiene."
+            "El video **requiere sumo-gui**. **No cierre** la ventana o TraCI se corta. "
+            "Puede dejarla detrás de otras apps. El avance se guarda en disco "
+            "(pulse «Actualizar progreso» si la barra no se mueve sola)."
         )
         st.warning(
             "Guion de cámara (**200 s** de simulación por toma): "
@@ -678,17 +712,18 @@ def step_sim() -> None:
         )
         video_capture = st.radio(
             "Modo de captura",
-            options=["traci", "screen"],
+            options=["screen", "traci"],
             format_func=lambda k: {
-                "traci": "Segundo plano (TraCI, recomendado)",
-                "screen": "Captura de pantalla (ventana visible)",
+                "screen": "Pantalla (recomendado · ventana abierta)",
+                "traci": "TraCI (experimental)",
             }[k],
             horizontal=True,
             index=0,
-            key="video_capture_mode",
+            key="video_capture_mode_v2",
             help=(
-                "TraCI escribe PNG sin traer sumo-gui al frente. "
-                "Pantalla = ImageGrab (útil si TraCI falla en su PC)."
+                "Pantalla: ImageGrab de sumo-gui (más estable en Windows). "
+                "Puede dejar la ventana detrás de otras, pero NO la cierre. "
+                "TraCI a veces cierra SUMO en Windows."
             ),
         )
         rc1, rc2 = st.columns(2)
@@ -723,7 +758,7 @@ def step_sim() -> None:
                 max_value=900,
                 value=200,
                 step=20,
-                key="camera_segment_s",
+                key="camera_segment_s_v2",
                 help="Por defecto 200 s: overview 2×2 km, zoom/espirales 400×400 m.",
             )
         )

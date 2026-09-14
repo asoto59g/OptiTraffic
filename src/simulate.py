@@ -853,10 +853,14 @@ def run_simulation(
             pass
         # Re-resolve HWND after window is fully up.
         gui_hwnd = _find_sumo_gui_hwnd(gui_pid) or gui_hwnd
+        # Do NOT minimize: OpenGL + TraCI screenshot on a minimized window
+        # often crashes sumo-gui on Windows ("Connection closed by SUMO").
         if capture_mode == "traci":
-            # Background recording: keep process alive, but don't occupy the desktop.
-            _minimize_sumo_gui(gui_hwnd)
-            log.info("Video: captura TraCI en segundo plano (sumo-gui minimizado)")
+            log.info(
+                "Video: captura TraCI (deje sumo-gui abierto; puede quedar detrás de otras ventanas)"
+            )
+        else:
+            log.info("Video: captura de pantalla OS (deje sumo-gui visible)")
 
     if edge_levels:
         for eid, level in edge_levels.items():
@@ -894,6 +898,37 @@ def run_simulation(
     camera_segment = max(30.0, float(camera_segment_s))
     net_bounds = load_net_bounds_from_cfg(cfg_safe) if use_gui else None
     last_camera_phase = ""
+    active_capture_mode = capture_mode
+    connection_lost = False
+    t = 0.0
+
+    def _emit_progress(sim_t: float, *, force: bool = False, message: str = "") -> None:
+        nonlocal last_progress_t
+        if progress_file is None and progress_cb is None:
+            return
+        if not force and (sim_t - last_progress_t) < 2.0:
+            return
+        last_progress_t = sim_t
+        if progress_file is not None:
+            try:
+                write_sim_progress(
+                    Path(progress_file),
+                    status="running",
+                    t=float(sim_t),
+                    end=float(end),
+                    frames=int(frame_i),
+                    vehicle_steps=int(vehicle_steps),
+                    camera_phase=last_camera_phase or "",
+                    capture_mode=active_capture_mode,
+                    message=message or "running",
+                )
+            except Exception:
+                log.debug("write_sim_progress falló", exc_info=True)
+        if progress_cb is not None:
+            try:
+                progress_cb(sim_t, end, frame_i)
+            except Exception:
+                pass
 
     try:
         end = float(traci.simulation.getEndTime())
@@ -908,12 +943,14 @@ def run_simulation(
 
     def _os_capture(sim_t: float) -> None:
         nonlocal frame_i, next_shot_at, gui_hwnd, capture_failures
-        nonlocal last_camera_phase
+        nonlocal last_camera_phase, active_capture_mode, connection_lost
         if frames_path is None or sim_t + 1e-9 < next_shot_at:
             return
         try:
             n_veh = len(traci.vehicle.getIDList())
-        except Exception:
+        except Exception as e:
+            if "Connection closed" in str(e) or e.__class__.__name__ == "FatalTraCIError":
+                connection_lost = True
             n_veh = 0
 
         hot = _traffic_hotspot() if n_veh > 0 else None
@@ -937,7 +974,13 @@ def run_simulation(
             next_shot_at = sim_t + every
             if shot.phase != last_camera_phase:
                 last_camera_phase = shot.phase
-                log.info("Video cámara · fase=%s t=%.0fs", shot.phase, sim_t)
+                log.info(
+                    "Video cámara · fase=%s t=%.0fs (segment=%ss)",
+                    shot.phase,
+                    sim_t,
+                    int(camera_segment),
+                )
+            _emit_progress(sim_t, force=True, message=f"camera:{shot.phase}")
             if not apply_camera_shot(shot):
                 capture_failures += 1
                 return
@@ -945,35 +988,45 @@ def run_simulation(
         shot_path = frames_path / f"frame_{frame_i:06d}.png"
         out_path = shot_path if path_is_safe(shot_path) else to_safe_path(shot_path)
 
-        # Prefer TraCI screenshots — no need to watch / focus the window.
-        used_traci = False
-        if capture_mode == "traci":
-            used_traci = _traci_screenshot(
+        if active_capture_mode == "traci":
+            queued = _traci_screenshot(
                 out_path,
                 width=int(screenshot_size[0]),
                 height=int(screenshot_size[1]),
             )
             try:
                 traci.simulationStep()
-            except traci.TraCIException:
-                pass
-            if used_traci and _wait_screenshot_file(out_path, timeout_s=2.0):
+            except Exception as e:
+                if "Connection closed" in str(e) or e.__class__.__name__ == "FatalTraCIError":
+                    connection_lost = True
+                    log.error("SUMO cerró la conexión durante captura TraCI: %s", e)
+                    return
+            if queued and _wait_screenshot_file(out_path, timeout_s=1.2):
                 if out_path != shot_path:
                     try:
                         shutil.copy2(out_path, shot_path)
                     except OSError:
                         pass
                 frame_i += 1
+                _emit_progress(sim_t, force=True, message="frame_ok")
                 return
-            # TraCI screenshot failed (known freeze/quirk on some Windows builds).
-            log.debug("TraCI screenshot no produjo archivo; fallback a captura de pantalla")
+            capture_failures += 1
+            if capture_failures >= 3:
+                active_capture_mode = "screen"
+                log.warning(
+                    "TraCI screenshot inestable (%d fallos); pasando a captura de pantalla",
+                    capture_failures,
+                )
 
-        # Fallback / screen mode: OS grab (needs a visible GUI).
+        # Screen / fallback grab
         try:
             traci.simulationStep()
-        except traci.TraCIException:
-            pass
-        time.sleep(0.12)
+        except Exception as e:
+            if "Connection closed" in str(e) or e.__class__.__name__ == "FatalTraCIError":
+                connection_lost = True
+                log.error("SUMO cerró la conexión durante captura: %s", e)
+                return
+        time.sleep(0.10)
         if gui_hwnd is None:
             gui_hwnd = _find_sumo_gui_hwnd(gui_pid)
         if not gui_hwnd:
@@ -986,49 +1039,56 @@ def run_simulation(
             return
         if _capture_hwnd_png(gui_hwnd, shot_path):
             frame_i += 1
+            _emit_progress(sim_t, force=True, message="frame_ok_screen")
         else:
             capture_failures += 1
             gui_hwnd = None
 
     try:
         t = 0.0
-        while t < end:
-            traci.simulationStep()
-            t = float(traci.simulation.getTime())
+        _emit_progress(0.0, force=True, message="sim_loop_start")
+        while t < end and not connection_lost:
+            try:
+                traci.simulationStep()
+            except Exception as e:
+                if "Connection closed" in str(e) or e.__class__.__name__ == "FatalTraCIError":
+                    connection_lost = True
+                    log.error(
+                        "Connection closed by SUMO en t≈%.0fs (frames=%d). "
+                        "Guardando resultados parciales. No cierre sumo-gui mientras graba.",
+                        t,
+                        frame_i,
+                    )
+                    break
+                raise
+            try:
+                t = float(traci.simulation.getTime())
+            except Exception:
+                if connection_lost:
+                    break
+                raise
 
             if use_gui:
                 _os_capture(t)
-                # Keep local time in sync if capture advanced an extra step.
+                if connection_lost:
+                    break
                 try:
                     t = float(traci.simulation.getTime())
                 except Exception:
                     pass
 
-            if progress_cb is not None or progress_file is not None:
-                if (t - last_progress_t) >= 5.0:
-                    last_progress_t = t
-                    if progress_file is not None:
-                        try:
-                            write_sim_progress(
-                                Path(progress_file),
-                                status="running",
-                                t=float(t),
-                                end=float(end),
-                                frames=int(frame_i),
-                                vehicle_steps=int(vehicle_steps),
-                            )
-                        except Exception:
-                            log.debug("write_sim_progress falló", exc_info=True)
-                    if progress_cb is not None:
-                        try:
-                            progress_cb(t, end, frame_i)
-                        except Exception:
-                            pass
+            _emit_progress(t)
 
             if t < warmup:
                 continue
 
-            veh_ids = traci.vehicle.getIDList()
+            try:
+                veh_ids = traci.vehicle.getIDList()
+            except Exception as e:
+                if "Connection closed" in str(e) or e.__class__.__name__ == "FatalTraCIError":
+                    connection_lost = True
+                    break
+                raise
             vehicle_steps += len(veh_ids)
             for vid in veh_ids:
                 try:
@@ -1036,9 +1096,7 @@ def run_simulation(
                     speed_sum += traci.vehicle.getSpeed(vid)
                     speed_samples += 1
                     eid = traci.vehicle.getRoadID(vid)
-                except traci.TraCIException:
-                    # Expected: vehicle can despawn between getIDList() and the query.
-                    # No logging here on purpose — fires routinely, would flood logs.
+                except Exception:
                     continue
                 if not eid or eid.startswith(":"):
                     continue
@@ -1048,7 +1106,7 @@ def run_simulation(
                 try:
                     acc["speed"] += traci.vehicle.getSpeed(vid)
                     acc["wait"] += traci.vehicle.getWaitingTime(vid)
-                except traci.TraCIException:
+                except Exception:
                     pass
                 acc["n"] += 1
 
@@ -1056,7 +1114,7 @@ def run_simulation(
                 for eid in list(edge_acc.keys()):
                     try:
                         occ = traci.edge.getLastStepOccupancy(eid)
-                    except traci.TraCIException:
+                    except Exception:
                         continue
                     edge_acc[eid]["occ"] += occ
                     edge_acc[eid]["max_occ"] = max(edge_acc[eid]["max_occ"], occ)
@@ -1125,11 +1183,16 @@ def run_simulation(
     elif use_gui and frame_i == 0:
         video_note = (
             f"; video: sin frames (ventana sumo-gui no capturable; fallos={capture_failures}). "
-            "Deje la ventana visible y no minimice."
+            "Deje la ventana abierta (no la cierre ni la minimice si usa captura TraCI)."
+        )
+    if connection_lost:
+        video_note += (
+            f"; SUMO cerró la conexión ~t={t:.0f}s "
+            f"(resultados parciales, frames={frame_i})"
         )
 
     result = SimResult(
-        duration_s=int(end),
+        duration_s=int(t) if connection_lost and t > 0 else int(end),
         vehicle_steps=vehicle_steps,
         total_waiting=total_waiting,
         mean_speed=mean_speed,
@@ -1142,6 +1205,7 @@ def run_simulation(
     )
     result._corr_detail = corr_detail + video_note  # type: ignore[attr-defined]
     result._warmup_s = warmup  # type: ignore[attr-defined]
+    result._connection_lost = connection_lost  # type: ignore[attr-defined]
     return result
 
 
