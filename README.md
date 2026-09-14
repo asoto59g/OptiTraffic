@@ -111,8 +111,8 @@ Al terminar la configuración (paso 3) o en resultados (paso 6):
 - En paso 6 se empaqueta un proyecto SUMO portable en `sumo/` (`optitraffic.sumocfg` relativo, rutas, red, KPIs; fondo OSM/satélite si se generó).
 - Se puede **sobrescribir** por nombre.
 - Carga desde el paso 3 (configs del mismo polígono, IoU ≥ 85%) o desde la **barra lateral**.
-- Los escenarios locales no se suben a git (`scenarios/*/` en `.gitignore`).
-
+- Los escenarios locales del usuario no se suben a git (`scenarios/*/` en `.gitignore`).
+- **Ejemplo incluido:** `scenarios/default_mvp_20260913_174921` (Liberia, Costa Rica). Se carga **por defecto** al abrir la app si aún no hay zona.
 ---
 
 ## Estructura del proyecto
