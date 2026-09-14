@@ -1,3 +1,6 @@
+<p align="center">
+  <img src="sumo.gif" alt="Traffic simulation" width="800">
+</p>
 # OptiTraffic
 
 [![GitHub](https://img.shields.io/badge/GitHub-asoto59g%2FOptiTraffic-181717?logo=github)](https://github.com/asoto59g/OptiTraffic)
