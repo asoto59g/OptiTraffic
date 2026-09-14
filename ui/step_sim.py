@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import streamlit as st
 
@@ -91,6 +92,85 @@ def _pid_running(pid: int) -> bool:
         return False
 
 
+def peek_running_sim_on_disk() -> dict | None:
+    """
+    If a background worker is still running under runs/current, return job+progress.
+    Used when Streamlit session was lost (PC sleep / browser refresh).
+    """
+    run_dir = SAFE_RUNS / "current"
+    progress_path = run_dir / "sim_progress.json"
+    job_path = run_dir / "sim_job.json"
+    prog = read_sim_progress(progress_path) or {}
+    if str(prog.get("status") or "") != "running":
+        return None
+    if not job_path.is_file():
+        return None
+    try:
+        job = json.loads(job_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    pid = int(prog.get("pid") or job.get("pid") or 0)
+    if pid and not _pid_running(pid):
+        return None
+    return {
+        "job": {
+            **job,
+            "pid": pid or int(job.get("pid") or 0),
+            "progress_file": str(progress_path),
+            "result_file": str(run_dir / "sim_result.json"),
+            "run_dir": str(run_dir),
+        },
+        "progress": prog,
+        "run_dir": str(run_dir),
+    }
+
+
+def restore_running_sim_after_session_loss(session: Any) -> bool:
+    """
+    Revive sim_job in session and restore study area if needed.
+    Returns True when a background sim is still running.
+    """
+    peeked = peek_running_sim_on_disk()
+    if not peeked:
+        return False
+    job = peeked["job"]
+    session.sim_job = job
+    session._default_scenario_applied = True
+
+    # Restore network/area so step 5 can render (session was wiped).
+    if getattr(session, "area", None) is None or not getattr(session, "edges_gj", None):
+        restore = job.get("ui_restore") or {}
+        folder_s = str(restore.get("scenario_folder") or session.get("scenario_folder") or "")
+        loaded = False
+        if folder_s:
+            folder = Path(folder_s)
+            if folder.is_dir() and (folder / "scenario.json").is_file():
+                try:
+                    from src.scenarios import apply_scenario_to_session, load_scenario
+
+                    apply_scenario_to_session(load_scenario(folder), session)
+                    loaded = True
+                except Exception:
+                    loaded = False
+        if not loaded:
+            try:
+                from src.scenarios import apply_default_example_if_empty
+
+                # Force attempt even if flag was set above
+                session._default_scenario_applied = False
+                apply_default_example_if_empty(session)
+                session._default_scenario_applied = True
+            except Exception:
+                pass
+
+    # Always park the wizard on Simulación while the worker runs.
+    session.step = STEPS[4]
+    session.nav_step = STEPS[4]
+    session._pending_nav = STEPS[4]
+    session._show_sim_resumed = True
+    return True
+
+
 def _finalize_sim_outputs(
     *,
     run_dir: Path,
@@ -142,35 +222,18 @@ def _finalize_sim_outputs(
         f"{'puertas' if gates else 'repartido'}{vid_msg}"
     )
     st.session_state.pop("sim_job", None)
+    # Leave step 5 so the simulate button is not left disabled on this page.
     go_to(STEPS[5])
+    st.rerun()
 
 
 def _recover_sim_job_from_disk() -> None:
     """If Streamlit lost session state, revive job from runs/current progress."""
     if st.session_state.get("sim_job"):
         return
-    run_dir = SAFE_RUNS / "current"
-    progress_path = run_dir / "sim_progress.json"
-    job_path = run_dir / "sim_job.json"
-    prog = read_sim_progress(progress_path) or {}
-    if str(prog.get("status") or "") != "running":
-        return
-    if not job_path.is_file():
-        return
-    try:
-        job = json.loads(job_path.read_text(encoding="utf-8"))
-    except Exception:
-        return
-    pid = int(prog.get("pid") or job.get("pid") or 0)
-    if pid and not _pid_running(pid):
-        return
-    st.session_state.sim_job = {
-        **job,
-        "pid": pid or int(job.get("pid") or 0),
-        "progress_file": str(progress_path),
-        "result_file": str(run_dir / "sim_result.json"),
-        "run_dir": str(run_dir),
-    }
+    peeked = peek_running_sim_on_disk()
+    if peeked:
+        st.session_state.sim_job = peeked["job"]
 
 
 def _handle_sim_job_ui(edges_gj: dict) -> bool:
@@ -211,7 +274,12 @@ def _handle_sim_job_ui(edges_gj: dict) -> bool:
             record_video=bool(job.get("record_video")),
             result=result,
         )
-        return True
+        return False  # unreachable if finalize reruns
+
+    if status == "done":
+        # Finished but result file missing — unlock the simulate button.
+        st.session_state.pop("sim_job", None)
+        return False
 
     if status == "error":
         st.error(f"Simulación (fondo): {prog.get('error') or 'error desconocido'}")
@@ -808,11 +876,19 @@ def step_sim() -> None:
     seeds = edge_ids[:: max(1, len(edge_ids) // 80)][:80] if edge_ids else []
 
     job_active = _handle_sim_job_ui(edges_gj)
+    # Only block a new run while a background job is still running.
+    job = st.session_state.get("sim_job")
+    sim_busy = False
+    if job:
+        run_dir = Path(job.get("run_dir") or (SAFE_RUNS / "current"))
+        prog = read_sim_progress(Path(job.get("progress_file") or (run_dir / "sim_progress.json"))) or {}
+        pid = int(prog.get("pid") or job.get("pid") or 0)
+        sim_busy = str(prog.get("status") or "") == "running" and (not pid or _pid_running(pid))
 
     if st.button(
         "Generar demanda y simular",
         type="primary",
-        disabled=bool(job_active or st.session_state.get("sim_job")),
+        disabled=bool(job_active or sim_busy),
     ):
         SAFE_RUNS.mkdir(parents=True, exist_ok=True)
         run_dir = SAFE_RUNS / "current"
@@ -955,6 +1031,14 @@ def step_sim() -> None:
                 "base_rate": int(base_rate),
                 "preload_vph": int(preload_vph) if gates else 0,
                 "flow_gates": gates_to_list(gates),
+                # So Streamlit can resume step 5 after PC sleep / session loss
+                "ui_restore": {
+                    "step": STEPS[4],
+                    "scenario_folder": str(st.session_state.get("scenario_folder") or ""),
+                    "city": str(st.session_state.get("city") or ""),
+                    "country": str(st.session_state.get("country") or ""),
+                    "net_path": str(st.session_state.get("net_path") or ""),
+                },
             }
             job_path = run_dir / "sim_job.json"
             job_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")

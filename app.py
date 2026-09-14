@@ -26,7 +26,7 @@ from ui.common import go_to, init_state  # noqa: E402
 from ui.step_config import step_config  # noqa: E402
 from ui.step_red import step_red  # noqa: E402
 from ui.step_results import step_results  # noqa: E402
-from ui.step_sim import step_sim  # noqa: E402
+from ui.step_sim import restore_running_sim_after_session_loss, step_sim  # noqa: E402
 from ui.step_tomtom import step_tomtom  # noqa: E402
 from ui.step_zona import step_zona  # noqa: E402
 
@@ -46,6 +46,11 @@ def sidebar() -> None:
 
     if st.session_state.pop("_show_default_loaded", None):
         st.sidebar.success(f"Ejemplo cargado: `{DEFAULT_EXAMPLE_SCENARIO}`")
+    if st.session_state.pop("_show_sim_resumed", None):
+        st.sidebar.warning(
+            "Simulación en curso recuperada — abra el paso **5. Simulación** "
+            "para ver el avance (SUMO sigue en segundo plano)."
+        )
 
     sumo = detect_sumo()
     if sumo.ok:
@@ -102,7 +107,11 @@ def sidebar() -> None:
 
 def main() -> None:
     init_state()
-    if apply_default_example_if_empty(st.session_state):
+    # PC sleep / browser refresh wipes Streamlit session but SUMO keeps running.
+    # Resume step 5 from disk BEFORE loading the default demo (which jumps to config).
+    if restore_running_sim_after_session_loss(st.session_state):
+        pass
+    elif apply_default_example_if_empty(st.session_state):
         # Land on config so the demo network is immediately usable.
         if st.session_state.get("edges_gj") or st.session_state.get("net_path"):
             st.session_state.step = STEPS[2]
