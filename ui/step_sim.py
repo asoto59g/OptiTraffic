@@ -185,12 +185,35 @@ def peek_running_sim_on_disk() -> dict | None:
 
 def _consume_sim_job(run_dir: Path) -> None:
     st.session_state.pop("sim_job", None)
+    run_dir = Path(run_dir)
     job_path = run_dir / "sim_job.json"
-    if job_path.is_file():
-        try:
-            job_path.rename(run_dir / "sim_job_consumed.json")
-        except Exception:
-            pass
+    if not job_path.is_file():
+        return
+
+    consumed_path = run_dir / "sim_job_consumed.json"
+    try:
+        job_path.replace(consumed_path)
+        return
+    except OSError:
+        pass
+
+    unique_consumed_path = (
+        run_dir / f"sim_job_consumed_{int(time.time())}_{os.getpid()}.json"
+    )
+    try:
+        job_path.rename(unique_consumed_path)
+        return
+    except OSError:
+        pass
+
+    try:
+        job_path.unlink()
+    except OSError:
+        write_sim_progress(
+            run_dir / "sim_progress.json",
+            status="consumed",
+            message="job_consumed_but_file_locked",
+        )
 
 
 def restore_running_sim_after_session_loss(session: Any) -> bool:
