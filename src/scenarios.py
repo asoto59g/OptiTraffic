@@ -56,6 +56,17 @@ def package_sumo_project(run_dir: Path, dest_dir: Path) -> Optional[Path]:
     if not run_dir.is_dir():
         return None
 
+    cfg_src = run_dir / "optitraffic.sumocfg"
+    source_gui_settings: Optional[str] = None
+    if cfg_src.is_file():
+        try:
+            tree = ET.parse(cfg_src)
+            gui_el = tree.find("./gui_only/gui-settings-file")
+            if gui_el is not None and gui_el.get("value"):
+                source_gui_settings = str(gui_el.get("value") or "")
+        except Exception:
+            log.debug("No se leyó gui-settings-file del sumocfg origen", exc_info=True)
+
     routes = run_dir / "routes.rou.xml"
     trips = run_dir / "trips.xml"
     if not routes.is_file() and not trips.is_file():
@@ -70,21 +81,32 @@ def package_sumo_project(run_dir: Path, dest_dir: Path) -> Optional[Path]:
     # Portable OSM/satellite background (tiles + rewritten viewsettings)
     bg_src = run_dir / "background"
     gui_settings_name: Optional[str] = None
-    if bg_src.is_dir() and (bg_src / "viewsettings_bg.xml").is_file():
-        from .sumo_background import copy_background_into_project
+    gui_ref = (source_gui_settings or "").replace("\\", "/")
+    source_uses_bg_dir = gui_ref.endswith("background/viewsettings_bg.xml")
+    if source_uses_bg_dir and bg_src.is_dir() and (bg_src / "viewsettings_bg.xml").is_file():
+        from .sumo_background import background_matches_net, copy_background_into_project
 
-        bg_settings = copy_background_into_project(bg_src, dest_dir, subdir="background")
+        sim_net = run_dir / "sim.net.xml"
+        bg_settings = None
+        if sim_net.is_file() and background_matches_net(bg_src, sim_net):
+            bg_settings = copy_background_into_project(bg_src, dest_dir, subdir="background")
         if bg_settings is not None:
             gui_settings_name = bg_settings.name
-    elif (dest_dir / "viewsettings_bg.xml").is_file():
+    elif (
+        source_gui_settings
+        and Path(source_gui_settings).name == "viewsettings_bg.xml"
+        and (dest_dir / "viewsettings_bg.xml").is_file()
+    ):
         gui_settings_name = "viewsettings_bg.xml"
-    elif (dest_dir / "viewsettings_record.xml").is_file():
+    elif (
+        (not source_gui_settings or Path(source_gui_settings).name == "viewsettings_record.xml")
+        and (dest_dir / "viewsettings_record.xml").is_file()
+    ):
         gui_settings_name = "viewsettings_record.xml"
 
     # Fallback net name if sim.net.xml missing (older runs)
     net_name = "sim.net.xml"
     if not (dest_dir / net_name).is_file():
-        cfg_src = run_dir / "optitraffic.sumocfg"
         if cfg_src.is_file():
             try:
                 tree = ET.parse(cfg_src)
@@ -115,7 +137,6 @@ def package_sumo_project(run_dir: Path, dest_dir: Path) -> Optional[Path]:
 
     # Read begin/end from existing cfg when possible
     begin, end = "0", "3600"
-    cfg_src = run_dir / "optitraffic.sumocfg"
     if cfg_src.is_file():
         try:
             tree = ET.parse(cfg_src)

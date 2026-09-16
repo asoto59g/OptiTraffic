@@ -1076,23 +1076,11 @@ def step_sim() -> None:
                         sumo=sumo,
                         force=False,
                     )
-                # Reuse fondo del paso 2 si la descarga a runs/current falló
-                if not gui_settings:
-                    prev = st.session_state.get("background_dir")
-                    if prev and Path(prev).is_dir() and (Path(prev) / "viewsettings_bg.xml").is_file():
-                        import shutil
-
-                        dest_bg = run_dir / "background"
-                        dest_bg.mkdir(parents=True, exist_ok=True)
-                        for f in Path(prev).iterdir():
-                            if f.is_file():
-                                shutil.copy2(f, dest_bg / f.name)
-                        if (dest_bg / "viewsettings_bg.xml").is_file():
-                            gui_settings = dest_bg / "viewsettings_bg.xml"
                 if gui_settings:
                     st.session_state.background_dir = str(run_dir / "background")
                     st.caption(f"Fondo listo: `{gui_settings}`")
                 else:
+                    st.session_state.pop("background_dir", None)
                     st.warning(
                         "No se pudo descargar el fondo (¿SUMO tileGet.py / red?). "
                         "La simulación continúa sin mapa base."
