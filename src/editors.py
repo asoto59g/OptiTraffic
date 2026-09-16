@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Optional
+
+from .logging_config import get_logger
+
+log = get_logger("editors")
 
 
 @dataclass
@@ -454,42 +459,143 @@ def collect_tls_junction_ids(edits: NetworkEdits, osm_tls_ids: Optional[list[str
     return list(dict.fromkeys(ids))
 
 
+def list_net_junction_ids(net_path: Path) -> set[str]:
+    """Non-internal junction ids present in a .net.xml."""
+    out: set[str] = set()
+    path = Path(net_path)
+    if not path.is_file():
+        return out
+    for _event, elem in ET.iterparse(path, events=("end",)):
+        if elem.tag != "junction":
+            continue
+        jid = elem.get("id") or ""
+        if jid and not jid.startswith(":"):
+            out.add(jid)
+        elem.clear()
+    return out
+
+
+def resolve_tls_junction_ids(
+    net_path: Path,
+    junction_ids: list[str],
+) -> tuple[list[str], list[str]]:
+    """
+    Keep / remap TLS junction ids so they exist in the current net.
+
+    Large cities (e.g. London) often join OSM nodes into cluster/joinedS_* junctions;
+    stale tls_list / placements still carry the old numeric OSM node ids.
+    Returns (resolved_ids, skipped_ids).
+    """
+    known = list_net_junction_ids(net_path)
+    if not known:
+        return [], list(dict.fromkeys(j for j in junction_ids if j))
+
+    # Token → junctions whose id embeds that OSM/node token (joined clusters).
+    by_token: dict[str, list[str]] = {}
+    for jid in known:
+        for tok in jid.replace("#", "_").split("_"):
+            if tok and tok not in ("joinedS", "joined", "cluster") and not tok.startswith(":"):
+                by_token.setdefault(tok, []).append(jid)
+
+    resolved: list[str] = []
+    skipped: list[str] = []
+    for rid in dict.fromkeys(junction_ids):
+        if not rid:
+            continue
+        if rid in known:
+            resolved.append(rid)
+            continue
+        cands = by_token.get(rid) or []
+        if cands:
+            cands = sorted(
+                cands,
+                key=lambda x: (
+                    0 if ("joined" in x or "cluster" in x) else 1,
+                    len(x),
+                ),
+            )
+            resolved.append(cands[0])
+            continue
+        skipped.append(rid)
+    return list(dict.fromkeys(resolved)), skipped
+
+
+def _unknown_junctions_from_netconvert(text: str) -> list[str]:
+    return re.findall(
+        r"junction '([^']+)' is not known",
+        text or "",
+        flags=re.IGNORECASE,
+    )
+
+
 def ensure_tls_junctions(
     net_in: Path,
     net_out: Path,
     junction_ids: list[str],
     netconvert_bin: Path,
-) -> Path:
-    """Force named junctions to be controlled by traffic lights via netconvert."""
+) -> list[str]:
+    """
+    Force named junctions to be controlled by traffic lights via netconvert.
+    Skips / remaps ids that are no longer junctions in net_in.
+    Returns the junction ids actually passed to --tls.set (may be empty).
+    """
     import shutil
 
     from .sumo_env import run_cmd
 
     net_out.parent.mkdir(parents=True, exist_ok=True)
-    ids = [j for j in dict.fromkeys(junction_ids) if j]
+    ids, skipped = resolve_tls_junction_ids(net_in, junction_ids)
+    if skipped:
+        log.warning(
+            "Semáforos omitidos (junction no existe en la red; ¿nodo unido en cluster?): %s",
+            skipped[:20],
+        )
     if not ids:
         if Path(net_in).resolve() != Path(net_out).resolve():
             shutil.copy2(net_in, net_out)
-        return net_out
+        return []
 
-    args = [
-        str(netconvert_bin),
-        "-s",
-        str(net_in),
-        "-o",
-        str(net_out),
-        "--tls.set",
-        ",".join(ids),
-        "--no-turnarounds.except-deadend",
-        "true",
-    ]
-    r = run_cmd(args, timeout=900)
+    def _run(tls_ids: list[str]):
+        args = [
+            str(netconvert_bin),
+            "-s",
+            str(net_in),
+            "-o",
+            str(net_out),
+            "--tls.set",
+            ",".join(tls_ids),
+            "--no-turnarounds.except-deadend",
+            "true",
+        ]
+        return run_cmd(args, timeout=900)
+
+    r = _run(ids)
     if r.returncode != 0 or not net_out.is_file():
-        detail = (r.stderr or r.stdout or "")[:600]
-        raise RuntimeError(
-            f"netconvert --tls.set falló al crear semáforos en {ids[:12]}: {detail}"
-        )
-    return net_out
+        detail = (r.stderr or r.stdout or "")
+        unknown = _unknown_junctions_from_netconvert(detail)
+        retry = [j for j in ids if j not in set(unknown)]
+        if unknown and retry and retry != ids:
+            log.warning(
+                "netconvert --tls.set reintento sin junctions desconocidos: %s",
+                unknown[:20],
+            )
+            try:
+                if net_out.is_file():
+                    net_out.unlink()
+            except OSError:
+                pass
+            r = _run(retry)
+            ids = retry
+        if r.returncode != 0 or not net_out.is_file():
+            # Last resort: keep original net so simulation can proceed with existing TLS.
+            if Path(net_in).resolve() != Path(net_out).resolve():
+                shutil.copy2(net_in, net_out)
+            log.error(
+                "netconvert --tls.set falló; se usa la red original. Detalle: %s",
+                detail[:600],
+            )
+            return []
+    return ids
 
 
 def apply_stop_signs_to_net(
@@ -636,7 +742,7 @@ def prepare_sim_network(
     try:
         step1 = work / "tls.net.xml"
         tls_jids = collect_tls_junction_ids(edits, osm_tls_ids)
-        ensure_tls_junctions(net_in, step1, tls_jids, nconv)
+        tls_jids = ensure_tls_junctions(net_in, step1, tls_jids, nconv)
 
         step2 = work / "stops.net.xml"
         apply_stop_signs_to_net(

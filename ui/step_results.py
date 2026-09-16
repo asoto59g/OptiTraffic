@@ -1,6 +1,8 @@
 """OptiTraffic wizard step module."""
 from __future__ import annotations
 
+import base64
+import html
 import sys
 from pathlib import Path
 
@@ -17,6 +19,63 @@ from src.simulate import SAFE_RUNS  # noqa: E402
 from ui.common import (  # noqa: E402
     render_study_map,
 )
+
+
+def _download_href(data: bytes, mime: str) -> str:
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _download_link(label: str, data: bytes, file_name: str, mime: str = "application/octet-stream") -> str:
+    href = _download_href(data, mime)
+    return (
+        '<a class="opt-download-link" '
+        f'href="{href}" download="{html.escape(file_name, quote=True)}">'
+        f"{html.escape(label)}</a>"
+    )
+
+
+def _render_download_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .opt-download-link {
+            align-items: center;
+            background: #ffffff;
+            border: 1px solid rgba(49, 51, 63, 0.2);
+            border-radius: 0.5rem;
+            color: rgb(49, 51, 63);
+            display: inline-flex;
+            font-weight: 400;
+            justify-content: center;
+            line-height: 1.4;
+            min-height: 2.5rem;
+            padding: 0.375rem 0.75rem;
+            text-decoration: none;
+            width: 100%;
+        }
+        .opt-download-link:hover {
+            border-color: rgb(255, 75, 75);
+            color: rgb(255, 75, 75);
+            text-decoration: none;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_download_link(
+    container,
+    label: str,
+    data: bytes,
+    file_name: str,
+    mime: str = "application/octet-stream",
+) -> None:
+    container.markdown(
+        _download_link(label, data, file_name, mime=mime),
+        unsafe_allow_html=True,
+    )
 
 
 def step_results() -> None:
@@ -75,16 +134,19 @@ def step_results() -> None:
     )
 
     run_dir = st.session_state.run_dir or (ROOT / "data" / "runs" / "current")
+    _render_download_styles()
     c1, c2 = st.columns(2)
     csv_path = Path(run_dir) / "edges.csv"
     gj_path = Path(run_dir) / "edges_result.geojson"
     if csv_path.exists():
-        c1.download_button("Descargar CSV edges", csv_path.read_bytes(), file_name="edges.csv")
+        _render_download_link(c1, "Descargar CSV edges", csv_path.read_bytes(), "edges.csv", "text/csv")
     if gj_path.exists():
-        c2.download_button(
+        _render_download_link(
+            c2,
             "Descargar GeoJSON resultado",
             gj_path.read_bytes(),
-            file_name="edges_result.geojson",
+            "edges_result.geojson",
+            "application/geo+json",
         )
 
     video_path = getattr(result, "video_path", None)
@@ -113,12 +175,12 @@ def step_results() -> None:
                 st.error(f"No se pudo ensamblar el MP4: {e}")
 
     if mp4_ok:
-        st.download_button(
+        _render_download_link(
+            st,
             "Descargar video (MP4)",
             Path(video_path).read_bytes(),
-            file_name="simulation.mp4",
-            mime="video/mp4",
-            key="dl_sim_mp4",
+            "simulation.mp4",
+            "video/mp4",
         )
         st.caption(f"`{video_path}` · {frames_count} frames · {Path(video_path).stat().st_size // 1024} KB")
     elif frames_count > 0:
