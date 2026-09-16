@@ -159,7 +159,8 @@ def peek_running_sim_on_disk() -> dict | None:
     progress_path = run_dir / "sim_progress.json"
     job_path = run_dir / "sim_job.json"
     prog = read_sim_progress(progress_path) or {}
-    if str(prog.get("status") or "") != "running":
+    status = str(prog.get("status") or "")
+    if status not in ("running", "done", "error"):
         return None
     if not job_path.is_file():
         return None
@@ -168,8 +169,7 @@ def peek_running_sim_on_disk() -> dict | None:
     except Exception:
         return None
     pid = int(prog.get("pid") or job.get("pid") or 0)
-    if not _worker_appears_alive(pid, prog):
-        return None
+    # We no longer drop the job if the worker is dead, so the UI can process the result/crash
     return {
         "job": {
             **job,
@@ -181,6 +181,16 @@ def peek_running_sim_on_disk() -> dict | None:
         "progress": prog,
         "run_dir": str(run_dir),
     }
+
+
+def _consume_sim_job(run_dir: Path) -> None:
+    st.session_state.pop("sim_job", None)
+    job_path = run_dir / "sim_job.json"
+    if job_path.is_file():
+        try:
+            job_path.rename(run_dir / "sim_job_consumed.json")
+        except Exception:
+            pass
 
 
 def restore_running_sim_after_session_loss(session: Any) -> bool:
@@ -279,7 +289,7 @@ def _finalize_sim_outputs(
         f"v_media={result.mean_speed:.2f} m/s · modo="
         f"{'puertas' if gates else 'repartido'}{vid_msg}"
     )
-    st.session_state.pop("sim_job", None)
+    _consume_sim_job(run_dir)
     # Leave step 5 so the simulate button is not left disabled on this page.
     go_to(STEPS[5])
     st.rerun()
@@ -318,7 +328,7 @@ def _handle_sim_job_ui(edges_gj: dict) -> bool:
             )
         except Exception as e:
             st.error(f"Simulación terminó pero no se pudo leer el resultado: {e}")
-            st.session_state.pop("sim_job", None)
+            _consume_sim_job(run_dir)
             return False
         _finalize_sim_outputs(
             run_dir=run_dir,
@@ -336,7 +346,7 @@ def _handle_sim_job_ui(edges_gj: dict) -> bool:
 
     if status == "done":
         # Finished but result file missing — unlock the simulate button.
-        st.session_state.pop("sim_job", None)
+        _consume_sim_job(run_dir)
         return False
 
     if status == "error":
@@ -345,7 +355,7 @@ def _handle_sim_job_ui(edges_gj: dict) -> bool:
         if tb:
             with st.expander("Detalle"):
                 st.code(str(tb))
-        st.session_state.pop("sim_job", None)
+        _consume_sim_job(run_dir)
         return False
 
     if not alive and status == "running":
@@ -378,7 +388,7 @@ def _handle_sim_job_ui(edges_gj: dict) -> bool:
             "El proceso SUMO se detuvo sin terminar (¿cerró la ventana sumo-gui?). "
             "Vuelva a lanzar la simulación; para 7200s+video use captura corta o sin video."
         )
-        st.session_state.pop("sim_job", None)
+        _consume_sim_job(run_dir)
         return False
 
     t = float(prog.get("t") or 0.0)
@@ -419,7 +429,7 @@ def _handle_sim_job_ui(edges_gj: dict) -> bool:
                 pass
             _close_traci()
             write_sim_progress(progress_path, status="error", error="cancelado_por_usuario")
-            st.session_state.pop("sim_job", None)
+            _consume_sim_job(run_dir)
             st.warning("Simulación cancelada.")
             st.rerun()
     # Soft auto-refresh while job runs (does not kill the worker).
@@ -1159,7 +1169,7 @@ def step_sim() -> None:
             st.rerun()
         except Exception as e:
             _close_traci()
-            st.session_state.pop("sim_job", None)
+            _consume_sim_job(run_dir)
             status.error(f"Simulación: {e}")
             st.exception(e)
 
