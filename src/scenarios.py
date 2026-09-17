@@ -42,7 +42,19 @@ def _slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "scenario"
 
 
-def package_sumo_project(run_dir: Path, dest_dir: Path) -> Optional[Path]:
+def _resolve_cfg_path(cfg_src: Path, raw_value: str) -> Path:
+    path = Path(raw_value)
+    if not path.is_absolute():
+        path = cfg_src.parent / path
+    return path
+
+
+def package_sumo_project(
+    run_dir: Path,
+    dest_dir: Path,
+    *,
+    fallback_net_path: Optional[Path] = None,
+) -> Optional[Path]:
     """
     Copy the last simulation's SUMO inputs into dest_dir and write a portable
     optitraffic.sumocfg with *relative* paths (openable in sumo-gui anywhere).
@@ -107,22 +119,27 @@ def package_sumo_project(run_dir: Path, dest_dir: Path) -> Optional[Path]:
     # Fallback net name if sim.net.xml missing (older runs)
     net_name = "sim.net.xml"
     if not (dest_dir / net_name).is_file():
-        if cfg_src.is_file():
-            try:
-                tree = ET.parse(cfg_src)
-                net_el = tree.find("./input/net-file")
-                if net_el is not None and net_el.get("value"):
-                    src_net = Path(net_el.get("value", ""))
-                    if src_net.is_file():
-                        net_name = src_net.name
-                        shutil.copy2(src_net, dest_dir / net_name)
-            except Exception:
-                log.warning("No se pudo leer net-file del sumocfg de la corrida", exc_info=True)
+        if fallback_net_path and Path(fallback_net_path).is_file():
+            src_net = Path(fallback_net_path)
+            net_name = src_net.name
+            if src_net.resolve() != (dest_dir / net_name).resolve():
+                shutil.copy2(src_net, dest_dir / net_name)
         if not (dest_dir / net_name).is_file():
             for cand in run_dir.glob("*.net.xml"):
                 net_name = cand.name
                 shutil.copy2(cand, dest_dir / net_name)
                 break
+        if cfg_src.is_file():
+            try:
+                tree = ET.parse(cfg_src)
+                net_el = tree.find("./input/net-file")
+                if not (dest_dir / net_name).is_file() and net_el is not None and net_el.get("value"):
+                    src_net = _resolve_cfg_path(cfg_src, net_el.get("value", ""))
+                    if src_net.is_file():
+                        net_name = src_net.name
+                        shutil.copy2(src_net, dest_dir / net_name)
+            except Exception:
+                log.warning("No se pudo leer net-file del sumocfg de la corrida", exc_info=True)
 
     if not (dest_dir / net_name).is_file():
         log.warning("package_sumo_project: sin red .net.xml en %s", run_dir)
@@ -313,7 +330,11 @@ def save_scenario(
         sumo_dir = folder / "sumo"
         if sumo_dir.exists():
             shutil.rmtree(sumo_dir, ignore_errors=True)
-        cfg = package_sumo_project(Path(run_dir), sumo_dir)
+        cfg = package_sumo_project(
+            Path(run_dir),
+            sumo_dir,
+            fallback_net_path=Path(net_path) if net_path else None,
+        )
         if cfg is not None:
             sumo_cfg_rel = "sumo/optitraffic.sumocfg"
 
@@ -413,7 +434,13 @@ def apply_scenario_to_session(data: dict[str, Any], session: Any) -> str:
     session.center = area.center
     session.preview_polygon = area.polygon
     session.sim_result = None
+    session.run_dir = None
     session.scenario_folder = str(data.get("folder") or "")
+    try:
+        session.pop("sim_job", None)
+        session.pop("background_dir", None)
+    except Exception:
+        pass
 
     net_path = data.get("net_path")
     if net_path and Path(net_path).exists():

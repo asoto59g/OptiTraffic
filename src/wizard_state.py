@@ -78,6 +78,7 @@ class WizardState:
         self.flow_gates = []
         self.sim_gate_edge_id = None
         self.sim_result = None
+        self.run_dir = None
         self.edge_levels_source = ""
 
     def bump_map(

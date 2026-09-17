@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -216,6 +217,44 @@ def _consume_sim_job(run_dir: Path) -> None:
         )
 
 
+def _clear_previous_run_outputs(run_dir: Path) -> None:
+    """Clear reused runs/current outputs before writing a new simulation."""
+    run_dir = Path(run_dir)
+    for name in (
+        "sim.net.xml",
+        "routes.rou.xml",
+        "routes.rou.alt.xml",
+        "trips.xml",
+        "tls.add.xml",
+        "stops.add.xml",
+        "parking.add.xml",
+        "lanes.patch.xml",
+        "viewsettings_record.xml",
+        "viewsettings_bg.xml",
+        "optitraffic.sumocfg",
+        "edges.csv",
+        "edges_result.geojson",
+        "kpis.json",
+        "sim_progress.json",
+        "sim_result.json",
+        "sim_job.json",
+        "sim_job_consumed.json",
+        "simulation.mp4",
+        "test_encode.mp4",
+    ):
+        try:
+            (run_dir / name).unlink()
+        except OSError:
+            pass
+    for stale_job in run_dir.glob("sim_job_consumed_*.json"):
+        try:
+            stale_job.unlink()
+        except OSError:
+            pass
+    for name in ("frames", "background"):
+        shutil.rmtree(run_dir / name, ignore_errors=True)
+
+
 def restore_running_sim_after_session_loss(session: Any) -> bool:
     """
     Revive sim_job in session and restore study area if needed.
@@ -275,6 +314,7 @@ def _finalize_sim_outputs(
     record_video: bool,
     result: SimResult,
 ) -> None:
+    st.session_state.run_dir = run_dir
     st.session_state.sim_result = result
     export_edge_csv(result, run_dir / "edges.csv")
     export_edge_geojson(edges_gj, result, run_dir / "edges_result.geojson")
@@ -1013,6 +1053,7 @@ def step_sim() -> None:
         SAFE_RUNS.mkdir(parents=True, exist_ok=True)
         run_dir = SAFE_RUNS / "current"
         run_dir.mkdir(parents=True, exist_ok=True)
+        _clear_previous_run_outputs(run_dir)
         st.session_state.run_dir = run_dir
         st.session_state.density_scenario_used = dens.key
         st.session_state.density_base_rate = int(base_rate)

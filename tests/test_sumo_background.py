@@ -158,3 +158,32 @@ def test_package_sumo_project_ignores_stale_background_without_metadata(tmp_path
     assert cfg is not None
     assert not (dest_dir / "background").exists()
     assert ET.parse(cfg).find("./gui_only/gui-settings-file") is None
+
+
+def test_package_sumo_project_prefers_fallback_net_over_external_cfg_net(tmp_path) -> None:
+    run_dir = tmp_path / "run"
+    dest_dir = tmp_path / "scenario" / "sumo"
+    run_dir.mkdir()
+    stale_external_net = tmp_path / "data" / "nets" / "liberia_costa_rica.net.xml"
+    stale_external_net.parent.mkdir(parents=True)
+    _write_net(stale_external_net, "-85.45,10.60,-85.41,10.64")
+    fallback_net = tmp_path / "london_great_britain.net.xml"
+    _write_net(fallback_net, "-0.15,51.49,-0.10,51.52")
+    (run_dir / "routes.rou.xml").write_text("<routes />", encoding="utf-8")
+    (run_dir / "optitraffic.sumocfg").write_text(
+        "<?xml version='1.0' encoding='utf-8'?>"
+        "<configuration><input>"
+        f"<net-file value='{stale_external_net}' />"
+        "<route-files value='routes.rou.xml' />"
+        "</input></configuration>",
+        encoding="utf-8",
+    )
+
+    cfg = package_sumo_project(run_dir, dest_dir, fallback_net_path=fallback_net)
+
+    assert cfg is not None
+    assert (dest_dir / "london_great_britain.net.xml").is_file()
+    assert not (dest_dir / "liberia_costa_rica.net.xml").exists()
+    net_el = ET.parse(cfg).find("./input/net-file")
+    assert net_el is not None
+    assert net_el.get("value") == "london_great_britain.net.xml"

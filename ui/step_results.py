@@ -5,6 +5,7 @@ import base64
 import html
 import sys
 from pathlib import Path
+from typing import Optional
 
 import streamlit as st
 
@@ -78,6 +79,66 @@ def _render_download_link(
     )
 
 
+def _path_or_none(value: object) -> Optional[Path]:
+    if not value:
+        return None
+    try:
+        return Path(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _run_dir_has_sumo_project(run_dir: Path) -> bool:
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        return False
+    if not (run_dir / "optitraffic.sumocfg").is_file():
+        return False
+    if not ((run_dir / "routes.rou.xml").is_file() or (run_dir / "trips.xml").is_file()):
+        return False
+    return (run_dir / "sim.net.xml").is_file() or any(run_dir.glob("*.net.xml"))
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path.absolute())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def _resolve_results_run_dir(result: object, session_run_dir: object = None) -> Path:
+    candidates: list[Path] = []
+    session_path = _path_or_none(session_run_dir)
+    if session_path is not None:
+        candidates.append(session_path)
+
+    frames_dir = _path_or_none(getattr(result, "frames_dir", None))
+    if frames_dir is not None:
+        candidates.append(frames_dir.parent)
+    video_path = _path_or_none(getattr(result, "video_path", None))
+    if video_path is not None:
+        candidates.append(video_path.parent)
+
+    candidates.extend([SAFE_RUNS / "current", ROOT / "data" / "runs" / "current"])
+    candidates = _dedupe_paths(candidates)
+
+    for candidate in candidates:
+        if _run_dir_has_sumo_project(candidate):
+            return candidate
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return SAFE_RUNS / "current"
+
+
 def step_results() -> None:
     st.header("6. Resultados")
     result = st.session_state.sim_result
@@ -133,7 +194,7 @@ def step_results() -> None:
         key_prefix="res",
     )
 
-    run_dir = st.session_state.run_dir or (ROOT / "data" / "runs" / "current")
+    run_dir = _resolve_results_run_dir(result, st.session_state.get("run_dir"))
     _render_download_styles()
     c1, c2 = st.columns(2)
     csv_path = Path(run_dir) / "edges.csv"
@@ -210,12 +271,7 @@ def step_results() -> None:
         extras = [p for p in (csv_path, gj_path) if p.exists()]
         if video_path and Path(video_path).exists():
             extras.append(Path(video_path))
-        sim_run = Path(run_dir) if run_dir else None
-        if sim_run is None or not (sim_run / "optitraffic.sumocfg").exists():
-            # Prefer the ASCII-safe run used by TraCI/SUMO
-            candidate = SAFE_RUNS / "current"
-            if (candidate / "optitraffic.sumocfg").exists():
-                sim_run = candidate
+        sim_run = Path(run_dir) if _run_dir_has_sumo_project(Path(run_dir)) else None
         folder = save_scenario(
             name,
             st.session_state.area,
