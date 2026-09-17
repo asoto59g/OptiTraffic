@@ -22,6 +22,29 @@ Simulador de tráfico vehicular urbano para evaluar mejoras en **semáforos**, *
 
 ---
 
+## Alcance técnico y límite de área
+
+OptiTraffic está diseñado para estudios urbanos acotados, con un límite máximo validado de **25 km²** por escenario. El límite está definido en `src/area.py` como `MAX_AREA_KM2 = 25.0` y se aplica al confirmar la zona mediante `validate_area()`, antes de construir la red, calibrar tráfico o ejecutar SUMO.
+
+Este límite mantiene controlados los costos computacionales del flujo completo: descarga y recorte OSM, conversión con `netconvert`, cálculo de edges, consulta/calibración TomTom, generación de demanda OD, ejecución TraCI, captura de video y empaquetado del proyecto SUMO. Para áreas mayores se recomienda dividir el estudio en polígonos operativos de hasta **25 km²** y comparar resultados por sector.
+
+---
+
+## Ventajas técnicas frente a usar SUMO-GUI desde cero
+
+OptiTraffic no reemplaza el motor de simulación de SUMO; automatiza la preparación del caso, reduce errores operativos y deja un paquete reproducible que puede abrirse en `sumo-gui`.
+
+- **Pipeline reproducible OSM -> SUMO:** geocodifica la zona, descarga o recorta OSM desde Overpass/Geofabrik, genera la red con `netconvert` y maneja rutas seguras para herramientas nativas en Windows.
+- **Configuración guiada de red:** permite editar semáforos, altos, carriles, parqueos y sentidos desde el mapa, preservando esos cambios como datos de escenario en vez de editarlos manualmente en XML.
+- **Demanda y calibración integradas:** genera demanda OD, puertas de entrada/salida, precarga y warmup; además puede usar niveles TomTom o calibración sintética cuando no hay cobertura de tráfico.
+- **Control de consistencia SUMO:** ordena rutas por `depart`, aplica fases TLS sobre el `.net.xml`, evita programas TLS duplicados en `additional-files` y empaqueta archivos con rutas relativas.
+- **Resultados listos para análisis:** exporta KPIs, CSV, GeoJSON de congestión, capturas/video y un proyecto `sumo/optitraffic.sumocfg` portable.
+- **Persistencia de escenarios:** guarda polígono, red, configuración, niveles de tráfico, puertas de flujo y resultados para repetir, comparar o reabrir un caso sin reconstruirlo manualmente.
+
+Desde SUMO-GUI puro, estos pasos deben resolverse manualmente con varias herramientas (`netconvert`, edición XML, `duarouter`, scripts TraCI, fuentes OSM/TomTom y control de rutas relativas). OptiTraffic concentra ese flujo en un wizard técnico y deja a SUMO-GUI como visor/ejecutor final del caso validado.
+
+---
+
 ## Requisitos
 
 1. **Python 3.10+**
@@ -62,7 +85,7 @@ streamlit run app.py
 
 | Paso | Qué hace |
 |------|----------|
-| **1. Zona** | Ciudad + **país en lista** (Geofabrik), geocodificación, rectángulo/dibujo/GeoJSON (máx. ~25 km²). Preview del extracto. |
+| **1. Zona** | Ciudad + **país en lista** (Geofabrik), geocodificación, rectángulo/dibujo/GeoJSON (máx. **25 km²**). Preview del extracto. |
 | **2. Red OSM→SUMO** | Overpass (rápido) o Geofabrik (país, **tope 500 MB**) → recorte → `netconvert` → mapa de edges. |
 | **3. Configuración** | Clic en **cruces** (semáforos) o **calles** (alto/parqueo/carriles). En **opciones extra**: dirección de flujo (avenida O→E/E→O, calle N→S/S→N). Guardar/cargar config ligada al polígono. |
 | **4. TomTom** | Flow tiles o **calibración sintética** (CR sin cobertura TomTom Flow). |
@@ -161,7 +184,7 @@ ruff check src ui tests app.py scripts
 
 - **TraCI:** si aparece `Connection already active` o `Connection closed by SUMO`, recargue la app y cierre procesos `sumo.exe` huérfanos. Los semáforos adicionales usan fases reales del `.net.xml` (no estados inventados de longitud fija).
 - **Mapa de configuración:** la lentitud al confirmar no depende de Geofabrik; se usa una red simplificada en Folium.
-- Áreas grandes ralentizan `netconvert` y la simulación; mantenga el polígono pequeño en el MVP.
+- Áreas mayores a **25 km²** se rechazan por validación; para zonas grandes divida el análisis en sectores.
 - No suba `.env` ni claves TomTom al repositorio.
 
 ---
