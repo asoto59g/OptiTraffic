@@ -244,6 +244,9 @@ def step_zona() -> None:
                 st.session_state.flow_gates = []
                 st.session_state.sim_gate_edge_id = None
                 st.session_state.sim_result = None
+                st.session_state.run_dir = None
+                st.session_state.pop("sim_job", None)
+                st.session_state.pop("background_dir", None)
                 st.success(f"Zona lista: {area.label} ({area.area_km2:.2f} km²)")
                 go_to(STEPS[1])
             except Exception as e:

@@ -1,0 +1,4 @@
+<?xml version='1.0' encoding='utf-8'?>
+<additional>
+  <!--TLS timings applied in net-file (11 programs). Ids: 1235918037, 3226659719, 3939916457, 3940756861, 3940756862, 4090401544, 4090401565, 4311832407, 4595782184, 5362392189, 975278559. No duplicate tlLogic here (avoids programID clash).-->
+</additional>

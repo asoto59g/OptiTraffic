@@ -1,8 +1,11 @@
 """OptiTraffic wizard step module."""
 from __future__ import annotations
 
+import base64
+import html
 import sys
 from pathlib import Path
+from typing import Optional
 
 import streamlit as st
 
@@ -17,6 +20,123 @@ from src.simulate import SAFE_RUNS  # noqa: E402
 from ui.common import (  # noqa: E402
     render_study_map,
 )
+
+
+def _download_href(data: bytes, mime: str) -> str:
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _download_link(label: str, data: bytes, file_name: str, mime: str = "application/octet-stream") -> str:
+    href = _download_href(data, mime)
+    return (
+        '<a class="opt-download-link" '
+        f'href="{href}" download="{html.escape(file_name, quote=True)}">'
+        f"{html.escape(label)}</a>"
+    )
+
+
+def _render_download_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .opt-download-link {
+            align-items: center;
+            background: #ffffff;
+            border: 1px solid rgba(49, 51, 63, 0.2);
+            border-radius: 0.5rem;
+            color: rgb(49, 51, 63);
+            display: inline-flex;
+            font-weight: 400;
+            justify-content: center;
+            line-height: 1.4;
+            min-height: 2.5rem;
+            padding: 0.375rem 0.75rem;
+            text-decoration: none;
+            width: 100%;
+        }
+        .opt-download-link:hover {
+            border-color: rgb(255, 75, 75);
+            color: rgb(255, 75, 75);
+            text-decoration: none;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_download_link(
+    container,
+    label: str,
+    data: bytes,
+    file_name: str,
+    mime: str = "application/octet-stream",
+) -> None:
+    container.markdown(
+        _download_link(label, data, file_name, mime=mime),
+        unsafe_allow_html=True,
+    )
+
+
+def _path_or_none(value: object) -> Optional[Path]:
+    if not value:
+        return None
+    try:
+        return Path(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _run_dir_has_sumo_project(run_dir: Path) -> bool:
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        return False
+    if not (run_dir / "optitraffic.sumocfg").is_file():
+        return False
+    if not ((run_dir / "routes.rou.xml").is_file() or (run_dir / "trips.xml").is_file()):
+        return False
+    return (run_dir / "sim.net.xml").is_file() or any(run_dir.glob("*.net.xml"))
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path.absolute())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def _resolve_results_run_dir(result: object, session_run_dir: object = None) -> Path:
+    candidates: list[Path] = []
+    session_path = _path_or_none(session_run_dir)
+    if session_path is not None:
+        candidates.append(session_path)
+
+    frames_dir = _path_or_none(getattr(result, "frames_dir", None))
+    if frames_dir is not None:
+        candidates.append(frames_dir.parent)
+    video_path = _path_or_none(getattr(result, "video_path", None))
+    if video_path is not None:
+        candidates.append(video_path.parent)
+
+    candidates.extend([SAFE_RUNS / "current", ROOT / "data" / "runs" / "current"])
+    candidates = _dedupe_paths(candidates)
+
+    for candidate in candidates:
+        if _run_dir_has_sumo_project(candidate):
+            return candidate
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return SAFE_RUNS / "current"
 
 
 def step_results() -> None:
@@ -74,17 +194,20 @@ def step_results() -> None:
         key_prefix="res",
     )
 
-    run_dir = st.session_state.run_dir or (ROOT / "data" / "runs" / "current")
+    run_dir = _resolve_results_run_dir(result, st.session_state.get("run_dir"))
+    _render_download_styles()
     c1, c2 = st.columns(2)
     csv_path = Path(run_dir) / "edges.csv"
     gj_path = Path(run_dir) / "edges_result.geojson"
     if csv_path.exists():
-        c1.download_button("Descargar CSV edges", csv_path.read_bytes(), file_name="edges.csv")
+        _render_download_link(c1, "Descargar CSV edges", csv_path.read_bytes(), "edges.csv", "text/csv")
     if gj_path.exists():
-        c2.download_button(
+        _render_download_link(
+            c2,
             "Descargar GeoJSON resultado",
             gj_path.read_bytes(),
-            file_name="edges_result.geojson",
+            "edges_result.geojson",
+            "application/geo+json",
         )
 
     video_path = getattr(result, "video_path", None)
@@ -113,12 +236,12 @@ def step_results() -> None:
                 st.error(f"No se pudo ensamblar el MP4: {e}")
 
     if mp4_ok:
-        st.download_button(
+        _render_download_link(
+            st,
             "Descargar video (MP4)",
             Path(video_path).read_bytes(),
-            file_name="simulation.mp4",
-            mime="video/mp4",
-            key="dl_sim_mp4",
+            "simulation.mp4",
+            "video/mp4",
         )
         st.caption(f"`{video_path}` · {frames_count} frames · {Path(video_path).stat().st_size // 1024} KB")
     elif frames_count > 0:
@@ -148,12 +271,7 @@ def step_results() -> None:
         extras = [p for p in (csv_path, gj_path) if p.exists()]
         if video_path and Path(video_path).exists():
             extras.append(Path(video_path))
-        sim_run = Path(run_dir) if run_dir else None
-        if sim_run is None or not (sim_run / "optitraffic.sumocfg").exists():
-            # Prefer the ASCII-safe run used by TraCI/SUMO
-            candidate = SAFE_RUNS / "current"
-            if (candidate / "optitraffic.sumocfg").exists():
-                sim_run = candidate
+        sim_run = Path(run_dir) if _run_dir_has_sumo_project(Path(run_dir)) else None
         folder = save_scenario(
             name,
             st.session_state.area,

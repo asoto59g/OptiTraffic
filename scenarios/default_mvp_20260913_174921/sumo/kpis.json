@@ -1,0 +1,279 @@
+{
+  "mean_speed": 1.9761424004427035,
+  "pct_edges_congested": 98.23100936524453,
+  "total_waiting": 42570861.0,
+  "tomtom_correlation": 0.595182324426407,
+  "vehicle_steps": 6945633,
+  "density_scenario": "medio",
+  "density_base_veh_h": 300,
+  "density_cap_veh_h": 350,
+  "preload_vph": 250,
+  "duration_s": 7200,
+  "warmup_s": 900,
+  "flow_gates": [
+    {
+      "edge_id": "107537258#5",
+      "kind": "entry",
+      "vehs_per_hour": 1000.0,
+      "name": "Corredor Chorotega",
+      "lat": 10.6257176179718,
+      "lon": -85.44571364990804,
+      "sentido": "unico",
+      "pair_edge_id": ""
+    },
+    {
+      "edge_id": "-107537258#11",
+      "kind": "exit",
+      "vehs_per_hour": 500.0,
+      "name": "Corredor Chorotega",
+      "lat": 10.62557887047021,
+      "lon": -85.44610405287085,
+      "sentido": "unico",
+      "pair_edge_id": ""
+    },
+    {
+      "edge_id": "390332910",
+      "kind": "entry",
+      "vehs_per_hour": 500.0,
+      "name": "Carretera Interamericana Norte",
+      "lat": 10.617093204258255,
+      "lon": -85.43739729182599,
+      "sentido": "unico",
+      "pair_edge_id": ""
+    },
+    {
+      "edge_id": "1451260004",
+      "kind": "exit",
+      "vehs_per_hour": 300.0,
+      "name": "Carretera Interamericana Norte",
+      "lat": 10.617090855086758,
+      "lon": -85.4375066981591,
+      "sentido": "unico",
+      "pair_edge_id": ""
+    },
+    {
+      "edge_id": "1451259114",
+      "kind": "entry",
+      "vehs_per_hour": 300.0,
+      "name": "Entrada Avenida 20",
+      "lat": 10.61805228422258,
+      "lon": -85.43790704035099,
+      "sentido": "doble",
+      "pair_edge_id": "-1451259114"
+    },
+    {
+      "edge_id": "-106618518#5",
+      "kind": "entry",
+      "vehs_per_hour": 150.0,
+      "name": "Calle Real",
+      "lat": 10.617578965627427,
+      "lon": -85.43232950459566,
+      "sentido": "doble",
+      "pair_edge_id": "106618518#5"
+    },
+    {
+      "edge_id": "106618518#5",
+      "kind": "exit",
+      "vehs_per_hour": 150.0,
+      "name": "Calle Real",
+      "lat": 10.617565352137404,
+      "lon": -85.43235534608212,
+      "sentido": "doble",
+      "pair_edge_id": "-106618518#5"
+    },
+    {
+      "edge_id": "-84718335#0",
+      "kind": "entry",
+      "vehs_per_hour": 500.0,
+      "name": "Avenida 11",
+      "lat": 10.630941132815009,
+      "lon": -85.44672190630608,
+      "sentido": "doble",
+      "pair_edge_id": "84718335#0"
+    },
+    {
+      "edge_id": "84718335#0",
+      "kind": "exit",
+      "vehs_per_hour": 150.0,
+      "name": "Avenida 11",
+      "lat": 10.630250801410726,
+      "lon": -85.44819383741167,
+      "sentido": "doble",
+      "pair_edge_id": "-84718335#0"
+    },
+    {
+      "edge_id": "-427091879#0",
+      "kind": "entry",
+      "vehs_per_hour": 300.0,
+      "name": "Calle Rodeito",
+      "lat": 10.63578281685183,
+      "lon": -85.45341871867377,
+      "sentido": "doble",
+      "pair_edge_id": "427091879#0"
+    },
+    {
+      "edge_id": "427091879#0",
+      "kind": "exit",
+      "vehs_per_hour": 150.0,
+      "name": "Calle Rodeito",
+      "lat": 10.635811753150097,
+      "lon": -85.45341966966727,
+      "sentido": "doble",
+      "pair_edge_id": "-427091879#0"
+    },
+    {
+      "edge_id": "-427091882#4",
+      "kind": "exit",
+      "vehs_per_hour": 300.0,
+      "name": "Carretera Interamericana Norte",
+      "lat": 10.638851199546275,
+      "lon": -85.45155972472945,
+      "sentido": "doble",
+      "pair_edge_id": "427091882#4"
+    },
+    {
+      "edge_id": "427091882#4",
+      "kind": "entry",
+      "vehs_per_hour": 500.0,
+      "name": "Carretera Interamericana Norte",
+      "lat": 10.638460414975775,
+      "lon": -85.45137104122517,
+      "sentido": "doble",
+      "pair_edge_id": "-427091882#4"
+    },
+    {
+      "edge_id": "106932687",
+      "kind": "entry",
+      "vehs_per_hour": 50.0,
+      "name": "Avenida 37",
+      "lat": 10.658248209488335,
+      "lon": -85.4231498193003,
+      "sentido": "doble",
+      "pair_edge_id": "-106932687"
+    },
+    {
+      "edge_id": "-106932687",
+      "kind": "exit",
+      "vehs_per_hour": 50.0,
+      "name": "Avenida 37",
+      "lat": 10.65822264458014,
+      "lon": -85.42313605776239,
+      "sentido": "doble",
+      "pair_edge_id": "106932687"
+    },
+    {
+      "edge_id": "-712906086#1",
+      "kind": "entry",
+      "vehs_per_hour": 50.0,
+      "name": "Calle Tierra Blanca",
+      "lat": 10.650809849032964,
+      "lon": -85.42437757137894,
+      "sentido": "doble",
+      "pair_edge_id": "712906086#1"
+    },
+    {
+      "edge_id": "-258418472#1",
+      "kind": "entry",
+      "vehs_per_hour": 50.0,
+      "name": "Diagonal 19",
+      "lat": 10.64799866306357,
+      "lon": -85.42504780662483,
+      "sentido": "doble",
+      "pair_edge_id": "258418472#1"
+    },
+    {
+      "edge_id": "258418475",
+      "kind": "entry",
+      "vehs_per_hour": 50.0,
+      "name": "Diagonal 21",
+      "lat": 10.651066508522042,
+      "lon": -85.42193157609219,
+      "sentido": "unico",
+      "pair_edge_id": ""
+    },
+    {
+      "edge_id": "587606000",
+      "kind": "entry",
+      "vehs_per_hour": 50.0,
+      "name": "Diagonal 23",
+      "lat": 10.64382025745921,
+      "lon": -85.42454134804147,
+      "sentido": "unico",
+      "pair_edge_id": ""
+    },
+    {
+      "edge_id": "713385206#0",
+      "kind": "entry",
+      "vehs_per_hour": 50.0,
+      "name": "Diagonal 21",
+      "lat": 10.643869886964968,
+      "lon": -85.42279603331157,
+      "sentido": "doble",
+      "pair_edge_id": "-713385206#0"
+    },
+    {
+      "edge_id": "727171050",
+      "kind": "entry",
+      "vehs_per_hour": 50.0,
+      "name": "V\u00eda 918",
+      "lat": 10.683743057424778,
+      "lon": -85.37441190440097,
+      "sentido": "doble",
+      "pair_edge_id": "-727171050"
+    },
+    {
+      "edge_id": "-83715123",
+      "kind": "entry",
+      "vehs_per_hour": 300.0,
+      "name": "Calle 13",
+      "lat": 10.6374059728363,
+      "lon": -85.43268925254029,
+      "sentido": "doble",
+      "pair_edge_id": "83715123"
+    },
+    {
+      "edge_id": "83715119#2",
+      "kind": "exit",
+      "vehs_per_hour": 300.0,
+      "name": "Diagonal 9",
+      "lat": 10.639880934413686,
+      "lon": -85.43120164881277,
+      "sentido": "unico",
+      "pair_edge_id": ""
+    },
+    {
+      "edge_id": "-369011877#6",
+      "kind": "exit",
+      "vehs_per_hour": 500.0,
+      "name": "Calle 13",
+      "lat": 10.640419143336114,
+      "lon": -85.43496464670957,
+      "sentido": "doble",
+      "pair_edge_id": "369011877#6"
+    },
+    {
+      "edge_id": "369010053#0",
+      "kind": "entry",
+      "vehs_per_hour": 200.0,
+      "name": "Calle 11 Cleto Gonz\u00e1lez V\u00edquez",
+      "lat": 10.63652764641319,
+      "lon": -85.43531771960487,
+      "sentido": "doble",
+      "pair_edge_id": "-369010053#0"
+    },
+    {
+      "edge_id": "365435693#6",
+      "kind": "entry",
+      "vehs_per_hour": 200.0,
+      "name": "Avenida 27",
+      "lat": 10.644924849400407,
+      "lon": -85.43926418403295,
+      "sentido": "unico",
+      "pair_edge_id": ""
+    }
+  ],
+  "demand_mode": "gates",
+  "record_video": false,
+  "video_path": null,
+  "frames_count": 0
+}

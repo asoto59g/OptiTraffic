@@ -284,6 +284,7 @@ def fetch_traffic_for_bbox(
     bbox: Tuple[float, float, float, float],
     api_key: Optional[str] = None,
     zoom: int = DEFAULT_ZOOM,
+    use_cache: bool = False,
 ) -> list[TrafficSegment]:
     api_key = api_key or load_api_key()
     if not api_key:
@@ -301,7 +302,7 @@ def fetch_traffic_for_bbox(
     empty_tiles = 0
     for x, y in tiles:
         try:
-            raw = fetch_flow_tile(zoom, x, y, api_key)
+            raw = fetch_flow_tile(zoom, x, y, api_key, use_cache=use_cache)
             if _is_empty_flow_tile(raw):
                 empty_tiles += 1
                 continue

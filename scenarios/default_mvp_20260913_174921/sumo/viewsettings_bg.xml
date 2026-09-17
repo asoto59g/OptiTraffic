@@ -1,0 +1,18 @@
+<?xml version='1.0' encoding='utf-8'?>
+<viewsettings><scheme name="real world"><vehicles vehicle_exaggeration="2.5" vehicle_minSize="3" vehicle_constantSize="0" vehicle_quality="2" showBlinker="0" /><persons person_exaggeration="1" person_minSize="1" person_constantSize="0" /><edges edge_exaggeration="1.0" /></scheme><delay value="100" /><decal file="background/tile2151_3850.png" centerX="574.454666753707" centerY="12398.450504153618" width="4830.811786497594" height="4751.537226020126" layer="-1" />
+    <decal file="background/tile2151_3851.png" centerX="598.431640878669" centerY="7622.399149198667" width="4831.400881123496" height="4752.298168862471" layer="-1" />
+    <decal file="background/tile2151_3852.png" centerX="622.3163341004401" centerY="2845.680941676954" width="4831.987287020776" height="4753.056604589336" layer="-1" />
+    <decal file="background/tile2151_3853.png" centerX="646.1086797471507" centerY="-1931.7015426546568" width="4832.571002526791" height="4753.812531143194" layer="-1" />
+    <decal file="background/tile2152_3850.png" centerX="5381.290067218302" centerY="12422.973451228812" width="4831.5891723594395" height="4750.944184631109" layer="-1" />
+    <decal file="background/tile2152_3851.png" centerX="5405.94841766014" centerY="7646.827974548796" width="4832.175715315272" height="4751.707833189517" layer="-1" />
+    <decal file="background/tile2152_3852.png" centerX="5430.511865139473" centerY="2870.015576607897" width="4832.759567398112" height="4752.468976319069" layer="-1" />
+    <decal file="background/tile2152_3853.png" centerX="5454.980341086397" centerY="-1907.4611665953416" width="4833.340726951137" height="4753.227611955255" layer="-1" />
+    <decal file="background/tile2153_3850.png" centerX="10188.221493703953" centerY="12448.183561962796" width="4832.369281963562" height="4750.353708304465" layer="-1" />
+    <decal file="background/tile2153_3851.png" centerX="10213.56129087403" centerY="7671.94132653391" width="4832.953274952015" height="4751.120064758696" layer="-1" />
+    <decal file="background/tile2153_3852.png" centerX="10238.803562775545" centerY="2895.0320992216" width="4833.5345749155385" height="4751.883917464875" layer="-1" />
+    <decal file="background/tile2153_3853.png" centerX="10263.948238940327" centerY="-1882.5415437268093" width="4834.113180203596" height="4752.6452643503435" layer="-1" />
+    <decal file="background/tile2154_3850.png" centerX="14995.251599545009" centerY="12474.08090833202" width="4833.152117519174" height="4749.765795326792" layer="-1" />
+    <decal file="background/tile2154_3851.png" centerX="15021.272915804177" centerY="7697.739276878769" width="4833.733562236885" height="4750.534861863591" layer="-1" />
+    <decal file="background/tile2154_3852.png" centerX="15047.194084235234" centerY="2920.7305809914833" width="4834.312311770394" height="4751.3014263261575" layer="-1" />
+    <decal file="background/tile2154_3853.png" centerX="15073.015032471041" centerY="-1856.9426028284943" width="4834.888364475453" height="4752.065486635314" layer="-1" />
+</viewsettings>

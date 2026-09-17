@@ -20,6 +20,9 @@ log = get_logger("scenarios")
 ROOT = Path(__file__).resolve().parents[1]
 SCENARIOS_DIR = ROOT / "scenarios"
 
+# Shipped demo (Liberia, CR) — auto-loaded when the session has no study area.
+DEFAULT_EXAMPLE_SCENARIO = "default_mvp_20260913_174921"
+
 # Files that make a self-contained sumo-gui project (opened via *.sumocfg).
 _SUMO_PROJECT_FILES = (
     "sim.net.xml",
@@ -39,7 +42,19 @@ def _slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "scenario"
 
 
-def package_sumo_project(run_dir: Path, dest_dir: Path) -> Optional[Path]:
+def _resolve_cfg_path(cfg_src: Path, raw_value: str) -> Path:
+    path = Path(raw_value)
+    if not path.is_absolute():
+        path = cfg_src.parent / path
+    return path
+
+
+def package_sumo_project(
+    run_dir: Path,
+    dest_dir: Path,
+    *,
+    fallback_net_path: Optional[Path] = None,
+) -> Optional[Path]:
     """
     Copy the last simulation's SUMO inputs into dest_dir and write a portable
     optitraffic.sumocfg with *relative* paths (openable in sumo-gui anywhere).
@@ -52,6 +67,17 @@ def package_sumo_project(run_dir: Path, dest_dir: Path) -> Optional[Path]:
     dest_dir = Path(dest_dir)
     if not run_dir.is_dir():
         return None
+
+    cfg_src = run_dir / "optitraffic.sumocfg"
+    source_gui_settings: Optional[str] = None
+    if cfg_src.is_file():
+        try:
+            tree = ET.parse(cfg_src)
+            gui_el = tree.find("./gui_only/gui-settings-file")
+            if gui_el is not None and gui_el.get("value"):
+                source_gui_settings = str(gui_el.get("value") or "")
+        except Exception:
+            log.debug("No se leyó gui-settings-file del sumocfg origen", exc_info=True)
 
     routes = run_dir / "routes.rou.xml"
     trips = run_dir / "trips.xml"
@@ -67,37 +93,53 @@ def package_sumo_project(run_dir: Path, dest_dir: Path) -> Optional[Path]:
     # Portable OSM/satellite background (tiles + rewritten viewsettings)
     bg_src = run_dir / "background"
     gui_settings_name: Optional[str] = None
-    if bg_src.is_dir() and (bg_src / "viewsettings_bg.xml").is_file():
-        from .sumo_background import copy_background_into_project
+    gui_ref = (source_gui_settings or "").replace("\\", "/")
+    source_uses_bg_dir = gui_ref.endswith("background/viewsettings_bg.xml")
+    if source_uses_bg_dir and bg_src.is_dir() and (bg_src / "viewsettings_bg.xml").is_file():
+        from .sumo_background import background_matches_net, copy_background_into_project
 
-        bg_settings = copy_background_into_project(bg_src, dest_dir, subdir="background")
+        sim_net = run_dir / "sim.net.xml"
+        bg_settings = None
+        if sim_net.is_file() and background_matches_net(bg_src, sim_net):
+            bg_settings = copy_background_into_project(bg_src, dest_dir, subdir="background")
         if bg_settings is not None:
             gui_settings_name = bg_settings.name
-    elif (dest_dir / "viewsettings_bg.xml").is_file():
+    elif (
+        source_gui_settings
+        and Path(source_gui_settings).name == "viewsettings_bg.xml"
+        and (dest_dir / "viewsettings_bg.xml").is_file()
+    ):
         gui_settings_name = "viewsettings_bg.xml"
-    elif (dest_dir / "viewsettings_record.xml").is_file():
+    elif (
+        (not source_gui_settings or Path(source_gui_settings).name == "viewsettings_record.xml")
+        and (dest_dir / "viewsettings_record.xml").is_file()
+    ):
         gui_settings_name = "viewsettings_record.xml"
 
     # Fallback net name if sim.net.xml missing (older runs)
     net_name = "sim.net.xml"
     if not (dest_dir / net_name).is_file():
-        cfg_src = run_dir / "optitraffic.sumocfg"
-        if cfg_src.is_file():
-            try:
-                tree = ET.parse(cfg_src)
-                net_el = tree.find("./input/net-file")
-                if net_el is not None and net_el.get("value"):
-                    src_net = Path(net_el.get("value", ""))
-                    if src_net.is_file():
-                        net_name = src_net.name
-                        shutil.copy2(src_net, dest_dir / net_name)
-            except Exception:
-                log.warning("No se pudo leer net-file del sumocfg de la corrida", exc_info=True)
+        if fallback_net_path and Path(fallback_net_path).is_file():
+            src_net = Path(fallback_net_path)
+            net_name = src_net.name
+            if src_net.resolve() != (dest_dir / net_name).resolve():
+                shutil.copy2(src_net, dest_dir / net_name)
         if not (dest_dir / net_name).is_file():
             for cand in run_dir.glob("*.net.xml"):
                 net_name = cand.name
                 shutil.copy2(cand, dest_dir / net_name)
                 break
+        if cfg_src.is_file():
+            try:
+                tree = ET.parse(cfg_src)
+                net_el = tree.find("./input/net-file")
+                if not (dest_dir / net_name).is_file() and net_el is not None and net_el.get("value"):
+                    src_net = _resolve_cfg_path(cfg_src, net_el.get("value", ""))
+                    if src_net.is_file():
+                        net_name = src_net.name
+                        shutil.copy2(src_net, dest_dir / net_name)
+            except Exception:
+                log.warning("No se pudo leer net-file del sumocfg de la corrida", exc_info=True)
 
     if not (dest_dir / net_name).is_file():
         log.warning("package_sumo_project: sin red .net.xml en %s", run_dir)
@@ -112,7 +154,6 @@ def package_sumo_project(run_dir: Path, dest_dir: Path) -> Optional[Path]:
 
     # Read begin/end from existing cfg when possible
     begin, end = "0", "3600"
-    cfg_src = run_dir / "optitraffic.sumocfg"
     if cfg_src.is_file():
         try:
             tree = ET.parse(cfg_src)
@@ -154,6 +195,36 @@ def list_scenarios() -> list[Path]:
         key=lambda p: (p / "scenario.json").stat().st_mtime,
         reverse=True,
     )
+
+
+def default_example_scenario_path() -> Optional[Path]:
+    """Path to the shipped demo scenario, or None if missing."""
+    folder = SCENARIOS_DIR / DEFAULT_EXAMPLE_SCENARIO
+    if folder.is_dir() and (folder / "scenario.json").is_file():
+        return folder
+    return None
+
+
+def apply_default_example_if_empty(session: Any) -> bool:
+    """
+    If the wizard has no study area yet, load the shipped example once.
+    Returns True when the example was applied.
+    """
+    if getattr(session, "area", None) is not None:
+        return False
+    if getattr(session, "_default_scenario_applied", False):
+        return False
+    folder = default_example_scenario_path()
+    session._default_scenario_applied = True
+    if folder is None:
+        return False
+    try:
+        data = load_scenario(folder)
+        apply_scenario_to_session(data, session)
+        return True
+    except Exception:
+        log.warning("No se pudo cargar el escenario de ejemplo %s", folder, exc_info=True)
+        return False
 
 
 def polygon_iou(a, b) -> float:
@@ -259,7 +330,11 @@ def save_scenario(
         sumo_dir = folder / "sumo"
         if sumo_dir.exists():
             shutil.rmtree(sumo_dir, ignore_errors=True)
-        cfg = package_sumo_project(Path(run_dir), sumo_dir)
+        cfg = package_sumo_project(
+            Path(run_dir),
+            sumo_dir,
+            fallback_net_path=Path(net_path) if net_path else None,
+        )
         if cfg is not None:
             sumo_cfg_rel = "sumo/optitraffic.sumocfg"
 
@@ -359,7 +434,13 @@ def apply_scenario_to_session(data: dict[str, Any], session: Any) -> str:
     session.center = area.center
     session.preview_polygon = area.polygon
     session.sim_result = None
+    session.run_dir = None
     session.scenario_folder = str(data.get("folder") or "")
+    try:
+        session.pop("sim_job", None)
+        session.pop("background_dir", None)
+    except Exception:
+        pass
 
     net_path = data.get("net_path")
     if net_path and Path(net_path).exists():

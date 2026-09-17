@@ -25,6 +25,30 @@ def test_normalize_tls_id_strips_legacy_prefix() -> None:
     assert normalize_tls_id(None, "7") == "7"
 
 
+def test_resolve_tls_junction_ids_maps_joined_clusters() -> None:
+    from src.editors import resolve_tls_junction_ids
+
+    net_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<net>
+  <junction id="100" type="priority" x="0" y="0" incLanes="" intLanes="" shape=""/>
+  <junction id="joinedS_3086_cluster_107867_4090401565_1680893657" type="priority" x="1" y="1" incLanes="" intLanes="" shape=""/>
+  <junction id=":internal_1" type="internal" x="2" y="2" incLanes="" intLanes="" shape=""/>
+</net>
+"""
+    with tempfile.TemporaryDirectory() as td:
+        net = Path(td) / "n.net.xml"
+        net.write_text(net_xml, encoding="utf-8")
+        resolved, skipped = resolve_tls_junction_ids(
+            net,
+            ["100", "4090401565", "999999", "joinedS_3086_cluster_107867_4090401565_1680893657"],
+        )
+        assert "100" in resolved
+        assert "joinedS_3086_cluster_107867_4090401565_1680893657" in resolved
+        assert "999999" in skipped
+        assert "4090401565" not in resolved  # remapped into joined id
+        assert any("4090401565" in j for j in resolved)
+
+
 def test_apply_tls_timings_patches_net_program_0() -> None:
     net_xml = """<?xml version="1.0" encoding="UTF-8"?>
 <net>

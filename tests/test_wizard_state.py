@@ -14,11 +14,17 @@ def test_request_nav_and_apply() -> None:
 
 
 def test_clear_network() -> None:
-    ws = WizardState(edge_levels={"a": 1.0}, flow_gates=[{"x": 1}], sim_result={"ok": True})
+    ws = WizardState(
+        edge_levels={"a": 1.0},
+        flow_gates=[{"x": 1}],
+        sim_result={"ok": True},
+        run_dir="runs/current",
+    )
     ws.clear_network()
     assert ws.edge_levels == {}
     assert ws.flow_gates == []
     assert ws.sim_result is None
+    assert ws.run_dir is None
 
 
 def test_ensure_session_defaults() -> None:

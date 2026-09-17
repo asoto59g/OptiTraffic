@@ -131,6 +131,10 @@ def step_red() -> None:
                 st.session_state.net_path = net
                 gj = edges_geojson(net, sumo=sumo)
                 st.session_state.edges_gj = gj
+                st.session_state.sim_result = None
+                st.session_state.run_dir = None
+                st.session_state.pop("sim_job", None)
+                st.session_state.pop("background_dir", None)
                 save_edges_geojson(net)
                 stats = gj.get("_direction_stats") or {}
                 try:

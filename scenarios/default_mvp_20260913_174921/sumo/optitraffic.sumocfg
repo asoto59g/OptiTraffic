@@ -1,0 +1,2 @@
+<?xml version='1.0' encoding='utf-8'?>
+<configuration><input><net-file value="sim.net.xml" /><route-files value="routes.rou.xml" /><additional-files value="tls.add.xml,stops.add.xml,parking.add.xml" /></input><time><begin value="0" /><end value="7200" /></time><processing><time-to-teleport value="120" /><collision.action value="warn" /><ignore-junction-blocker value="0" /></processing><gui_only><gui-settings-file value="viewsettings_bg.xml" /></gui_only></configuration>
